@@ -44,6 +44,7 @@ except Exception:
     pass
 
 from utils import Configuration, DatabaseType, get_results_run_dir  # noqa: E402
+from utils.cache_scripts.sql_generation_cache import get_sql_execution_cache  # noqa: E402
 from utils.db_connector import execute_sql_on_attached_tables  # noqa: E402
 
 
@@ -148,6 +149,99 @@ def _execute_one(
     )
 
 
+def run_execute_with_execution_cache(
+    sql: str,
+    table_full_ids: List[str],
+    config: Configuration,
+    *,
+    alias_to_full_id: Optional[Dict[str, str]] = None,
+    row_limit: Optional[int] = None,
+    timeout_seconds: int = 60,
+    use_cache: bool = True,
+) -> Tuple[List[Dict[str, Any]], bool, Optional[str], bool]:
+    """Run ``execute_sql_on_attached_tables``, optionally via dataset-global cache (``SQLExecutionCache``).
+
+    Returns:
+        (rows, duplicates_skipped, error, cache_hit)
+        ``error`` is ``None`` on success. ``cache_hit`` is True only when ``use_cache`` and a cache entry was used.
+    """
+    if not use_cache:
+        rows: List[Dict[str, Any]] = []
+        dup = False
+        err: Optional[str] = None
+        try:
+            rows, dup = execute_sql_on_attached_tables(
+                sql,
+                table_full_ids,
+                config,
+                row_limit=row_limit,
+                alias_to_full_id=alias_to_full_id,
+                timeout_seconds=int(timeout_seconds),
+            )
+        except Exception as e:
+            err = str(e)
+        return rows, dup, err, False
+
+    exec_cache = get_sql_execution_cache(config.get_dataset_cache_dir("sql_generation"))
+    ds = config.database_type.value
+    cached = exec_cache.get_execution(
+        sql=sql,
+        table_full_ids=table_full_ids,
+        alias_to_full_id=alias_to_full_id,
+        row_limit=row_limit,
+        timeout_seconds=int(timeout_seconds),
+        dataset=ds,
+    )
+    if cached is not None:
+        if cached.get("success"):
+            return (
+                list(cached.get("rows") or []),
+                bool(cached.get("duplicates_skipped", False)),
+                None,
+                True,
+            )
+        err_val = cached.get("error")
+        return (
+            [],
+            bool(cached.get("duplicates_skipped", False)),
+            str(err_val) if err_val is not None else "SQL execution failed (cached)",
+            True,
+        )
+
+    rows_miss: List[Dict[str, Any]] = []
+    dup_miss = False
+    err_miss: Optional[str] = None
+    try:
+        rows_miss, dup_miss = execute_sql_on_attached_tables(
+            sql,
+            table_full_ids,
+            config,
+            row_limit=row_limit,
+            alias_to_full_id=alias_to_full_id,
+            timeout_seconds=int(timeout_seconds),
+        )
+    except Exception as e:
+        err_miss = str(e)
+
+    try:
+        exec_cache.set_execution(
+            sql=sql,
+            table_full_ids=table_full_ids,
+            alias_to_full_id=alias_to_full_id,
+            row_limit=row_limit,
+            timeout_seconds=int(timeout_seconds),
+            dataset=ds,
+            success=err_miss is None,
+            rows=rows_miss,
+            duplicates_skipped=dup_miss,
+            error=err_miss,
+        )
+    except Exception:
+        pass
+
+    return rows_miss, dup_miss, err_miss, False
+
+
 def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Execute generated SQLs (no evaluation).")
     p.add_argument(
@@ -214,6 +308,15 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("--start", type=int, default=0, help="Start index (default: 0).")
     p.add_argument("--limit", type=int, default=None, help="Optional number of items to process.")
     p.add_argument("--no-rows", action="store_true", default=False, help="Do not store rows in outputs (summary only).")
+    p.add_argument(
+        "--cache-execution",
+        action="store_true",
+        default=False,
+        help=(
+            "Read/write sql_execution_cache.json under cache/<dataset>/sql_generation/. "
+            "When omitted (default), every query is executed against SQLite with no execution cache."
+        ),
+    )
     p.add_argument(
         "--out",
         type=str,
@@ -293,7 +396,8 @@ def main(args: argparse.Namespace) -> int:
     print(f"Loaded SQLs: {len(sqls)} | details: {len(details)} | processing: {end-start}")
     print(
         f"row_limit: {row_limit if row_limit is not None else 'none'} | "
-        f"timeout_seconds: {int(args.timeout_seconds)}"
+        f"timeout_seconds: {int(args.timeout_seconds)} | "
+        f"cache_execution: {bool(args.cache_execution)}"
     )
 
     for i in range(start, end):
@@ -332,22 +436,40 @@ def main(args: argparse.Namespace) -> int:
         error: Optional[str] = None
         duplicates_skipped = False
         executed = False
+        execution_cache_hit = False
 
         # - If SQL is missing, treat as "not executed" (no exception).
         # - If tables are missing, treat as "not executed" (no exception).
         if sql and (table_full_ids or alias_to_full_id):
             try:
-                rows, duplicates_skipped = _execute_one(
-                    sql=str(sql),
-                    table_full_ids=table_full_ids,
+                rows, duplicates_skipped, error, execution_cache_hit = run_execute_with_execution_cache(
+                    str(sql),
+                    table_full_ids,
+                    config,
                     alias_to_full_id=alias_to_full_id,
-                    config=config,
                     row_limit=row_limit,
                     timeout_seconds=int(args.timeout_seconds),
+                    use_cache=bool(args.cache_execution),
                 )
-                executed = True
-            except Exception as e:
-                error = str(e)
+                executed = error is None
+            except Exception:  # pragma: no cover - defensive fallback
+                execution_cache_hit = False
+                try:
+                    rows, duplicates_skipped = _execute_one(
+                        sql=str(sql),
+                        table_full_ids=table_full_ids,
+                        alias_to_full_id=alias_to_full_id,
+                        config=config,
+                        row_limit=row_limit,
+                        timeout_seconds=int(args.timeout_seconds),
+                    )
+                    executed = True
+                    error = None
+                except Exception as e:
+                    error = str(e)
+                    rows = []
+                    duplicates_skipped = False
+                    executed = False
 
         elapsed_s = float(time.time() - t0)
         row_count = int(len(rows or []))
@@ -363,6 +485,7 @@ def main(args: argparse.Namespace) -> int:
             "duplicates_skipped": bool(duplicates_skipped),
             "db_ids_involved": db_ids,
             "tables_used_source": table_full_ids_source,
+            "execution_cache_hit": bool(execution_cache_hit),
         }
         out_summary.append(summary)
 

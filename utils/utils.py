@@ -3,7 +3,7 @@
 import os
 from enum import Enum
 from pathlib import Path
-from typing import Optional
+from typing import Any, Callable, Dict, Optional
 
 try:
     from dotenv import load_dotenv
@@ -11,6 +11,45 @@ try:
     load_dotenv()
 except Exception:
     pass
+
+
+def _truncate_debug_text(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 3)] + "..."
+
+
+def summarize_llm_invoke_error(exc: BaseException, *, max_len: int = 4000) -> str:
+    """Collect exception text plus HTTP/SDK payloads (OpenRouter often returns a generic top-level message)."""
+    parts: list[str] = []
+    seen: set[int] = set()
+    cur: BaseException | None = exc
+    for _ in range(10):
+        if cur is None or id(cur) in seen:
+            break
+        seen.add(id(cur))
+        main = str(cur).strip() or cur.__class__.__name__
+        parts.append(main)
+
+        resp = getattr(cur, "response", None)
+        if resp is not None:
+            try:
+                text = getattr(resp, "text", "") or ""
+                if text.strip():
+                    parts.append(f"http_response={_truncate_debug_text(text, 1800)}")
+            except Exception:
+                pass
+        try:
+            body = getattr(cur, "body", None)
+            if body is not None and str(body).strip():
+                parts.append(f"sdk_body={_truncate_debug_text(str(body), 1800)}")
+        except Exception:
+            pass
+
+        cur = getattr(cur, "__cause__", None)
+
+    joined = " | ".join(parts)
+    return joined[:max_len]
 
 
 def _sanitize_path_component(value: object) -> str:
@@ -45,6 +84,7 @@ class DatabaseType(str, Enum):
 
     SPIDER = "spider"
     BIRD = "bird"
+    BEAVER = "beaver"
     MMQA = "mmqa"
 
 
@@ -70,6 +110,14 @@ class Configuration:
         run_tag = make_run_tag(llm_model=self.llm_model, embedding_model=self.embedding_model)
         return str(root / "cache" / self.database_type.value / run_tag / name)
 
+    def get_dataset_cache_dir(self, name: str) -> str:
+        """Return `<project_root>/cache/<dataset>/<name>` (no LLM/embedding run tag).
+
+        Use for caches shared across table-selection / embedding configurations.
+        """
+        root = _detect_project_root()
+        return str(root / "cache" / self.database_type.value / name)
+
     def create_llm(self):
         """Create a chat model used by standalone scripts."""
         return create_llm(self.llm_model, temperature=self.temperature)
@@ -88,10 +136,191 @@ def _detect_project_root() -> Path:
     return here.parent.parent
 
 
+def configure_hf_hub_cache(
+    project_root: Optional[Path] = None,
+    *,
+    force: bool = False,
+) -> Path:
+    """Point Hugging Face caches at ``<project_root>/.hf_cache``.
+
+    Compute nodes often lack a writable ``~/.cache/huggingface``. On SLURM jobs we
+    always redirect caches to project storage (override inherited login-node paths).
+    """
+    root = project_root or _detect_project_root()
+    hf_home = root / ".hf_cache"
+    transformers_cache = hf_home / "transformers"
+    hub_cache = hf_home / "hub"
+    hf_home.mkdir(parents=True, exist_ok=True)
+    transformers_cache.mkdir(parents=True, exist_ok=True)
+    hub_cache.mkdir(parents=True, exist_ok=True)
+
+    on_slurm = bool(os.environ.get("SLURM_JOB_ID"))
+    env_map = {
+        "HF_HOME": str(hf_home),
+        "TRANSFORMERS_CACHE": str(transformers_cache),
+        "HUGGINGFACE_HUB_CACHE": str(hub_cache),
+    }
+    for key, value in env_map.items():
+        if force or on_slurm or key not in os.environ:
+            os.environ[key] = value
+    return hf_home
+
+
+def extract_tokenizer(model: Any) -> Optional[Any]:
+    """Best-effort tokenizer lookup across LangChain/HF wrappers."""
+    candidates = [
+        ("llm", "pipeline", "tokenizer"),
+        ("pipeline", "tokenizer"),
+        ("tokenizer",),
+    ]
+    for chain in candidates:
+        obj = model
+        ok = True
+        for attr in chain:
+            obj = getattr(obj, attr, None)
+            if obj is None:
+                ok = False
+                break
+        if ok and obj is not None:
+            return obj
+    return None
+
+
+def estimate_token_count(text: str, tokenizer: Optional[Any]) -> Optional[int]:
+    if not text:
+        return 0
+    if tokenizer is not None:
+        try:
+            ids = tokenizer.encode(str(text), add_special_tokens=False)
+            if isinstance(ids, list):
+                return int(len(ids))
+        except Exception:
+            pass
+        try:
+            out = tokenizer(str(text), add_special_tokens=False)
+            if isinstance(out, dict) and isinstance(out.get("input_ids"), list):
+                return int(len(out.get("input_ids")))
+        except Exception:
+            pass
+    try:
+        return int(max(1, len(str(text).split())))
+    except Exception:
+        return None
+
+
+def llm_usage_from_prompt_and_output(
+    model: Any,
+    prompt_text: str,
+    output_text: str,
+    *,
+    ai_message: Optional[Any] = None,
+    cost_usd: float = 0.0,
+) -> Dict[str, Any]:
+    """
+    Provider token usage from message metadata when present; else tokenizer estimates.
+
+    Returns a dict suitable for cluster_summary.llm_usage / eval aggregation:
+    input_tokens, output_tokens, total_tokens, cost_usd
+    """
+    llm_usage: Dict[str, Any] = {"input_tokens": None, "output_tokens": None, "total_tokens": None}
+
+    if ai_message is not None:
+        try:
+            meta = getattr(ai_message, "response_metadata", {}) or {}
+            usage_meta = meta.get("token_usage") or getattr(ai_message, "usage_metadata", {}) or {}
+            llm_usage["input_tokens"] = usage_meta.get("input_tokens") or usage_meta.get("prompt_tokens")
+            llm_usage["output_tokens"] = usage_meta.get("output_tokens") or usage_meta.get("completion_tokens")
+            llm_usage["total_tokens"] = usage_meta.get("total_tokens")
+        except Exception:
+            pass
+
+    try:
+        if (
+            llm_usage.get("input_tokens") is None
+            and llm_usage.get("output_tokens") is None
+            and llm_usage.get("total_tokens") is None
+        ):
+            tokenizer = extract_tokenizer(model)
+            in_tok = estimate_token_count(prompt_text, tokenizer)
+            out_tok = estimate_token_count(output_text, tokenizer)
+            if in_tok is not None:
+                llm_usage["input_tokens"] = int(in_tok)
+            if out_tok is not None:
+                llm_usage["output_tokens"] = int(out_tok)
+            if in_tok is not None and out_tok is not None:
+                llm_usage["total_tokens"] = int(in_tok + out_tok)
+    except Exception:
+        pass
+
+    out = dict(llm_usage)
+    out["cost_usd"] = float(cost_usd)
+    return out
+
+
 def _is_huggingface_model(model_name: str) -> bool:
     return isinstance(model_name, str) and (
         model_name.startswith("huggingface:") or model_name.startswith("hf:")
     )
+
+
+_init_chat_model_fn: Optional[Callable[..., Any]] = None
+
+
+def _get_init_chat_model() -> Callable[..., Any]:
+    """Resolve LangChain's `init_chat_model` once (first use), not on every `create_llm` call."""
+    global _init_chat_model_fn
+    if _init_chat_model_fn is None:
+        try:
+            from langchain.chat_models import init_chat_model as _fn
+        except ImportError:  # pragma: no cover
+            from langchain.chat_models.base import init_chat_model as _fn
+
+        _init_chat_model_fn = _fn
+    return _init_chat_model_fn
+
+
+_init_embeddings_fn: Optional[Callable[..., Any]] = None
+
+
+def _get_init_embeddings() -> Callable[..., Any]:
+    """Resolve LangChain's `init_embeddings` once (first use), not on every `create_embeddings` call."""
+    global _init_embeddings_fn
+    if _init_embeddings_fn is None:
+        try:
+            from langchain.embeddings import init_embeddings as _fn
+        except ImportError:  # pragma: no cover
+            from langchain.embeddings.base import init_embeddings as _fn
+
+        _init_embeddings_fn = _fn
+    return _init_embeddings_fn
+
+
+def _create_openrouter_chat(model_name: str, *, temperature: float) -> Any:
+    """OpenRouter via `langchain-openrouter` (more reliable than `init_chat_model` for this provider)."""
+    raw_model = model_name.split(":", 1)[1].strip() if ":" in model_name else ""
+    if not raw_model:
+        raise ValueError(
+            "OpenRouter model id is required, e.g. openrouter:meta-llama/llama-3.2-3b-instruct"
+        )
+    try:
+        from langchain_openrouter import ChatOpenRouter
+    except Exception as import_exc:  # pragma: no cover
+        raise ImportError(
+            "OpenRouter support requires langchain-openrouter. "
+            "Install with: pip install -U langchain-openrouter"
+        ) from import_exc
+
+    api_key = os.environ.get("OPENROUTER_API_KEY") or os.environ.get("OPEN_ROUTER_API_KEY")
+    # Keep completion budget modest: large max_tokens + long prompts can exceed
+    # provider context and surface as generic OpenRouter "Provider returned error".
+    kwargs: Dict[str, Any] = {
+        "model": raw_model,
+        "temperature": float(temperature or 0.0),
+        "max_tokens": 8192,
+    }
+    if api_key:
+        kwargs["api_key"] = api_key
+    return ChatOpenRouter(**kwargs)
 
 
 def _create_huggingface_chat(model_name: str, *, temperature: float = 0.0):
@@ -117,20 +346,7 @@ def _create_huggingface_chat(model_name: str, *, temperature: float = 0.0):
     is_llama_3_1_8b = repo_id == "meta-llama/Llama-3.1-8B-Instruct"
     is_qwen_2_5_7b = repo_id == "Qwen/Qwen2.5-7B-Instruct"
 
-    # Ensure HF caches are writable inside the project directory.
-    try:
-        project_root = _detect_project_root()
-        hf_home = project_root / ".hf_cache"
-        transformers_cache = hf_home / "transformers"
-        hub_cache = hf_home / "hub"
-        hf_home.mkdir(parents=True, exist_ok=True)
-        transformers_cache.mkdir(parents=True, exist_ok=True)
-        hub_cache.mkdir(parents=True, exist_ok=True)
-        os.environ.setdefault("HF_HOME", str(hf_home))
-        os.environ.setdefault("TRANSFORMERS_CACHE", str(transformers_cache))
-        os.environ.setdefault("HUGGINGFACE_HUB_CACHE", str(hub_cache))
-    except Exception:
-        pass
+    configure_hf_hub_cache()
 
     # Respect an HF token from environment for gated repos.
     try:
@@ -192,7 +408,13 @@ def _create_huggingface_chat(model_name: str, *, temperature: float = 0.0):
         tokenizer=tokenizer,
         **gen_kwargs,
     )
-    hf_llm = HuggingFacePipeline(pipeline=gen_pipe)
+    # Explicitly clear wrapper-level generation kwargs. Some langchain-huggingface
+    # versions otherwise inject sampling params (temperature/top_p/top_k) that are
+    # not accepted by every transformers backend and emit noisy warnings.
+    try:
+        hf_llm = HuggingFacePipeline(pipeline=gen_pipe, model_kwargs={}, pipeline_kwargs={})
+    except TypeError:
+        hf_llm = HuggingFacePipeline(pipeline=gen_pipe)
 
     # For these instruct models, apply the tokenizer chat template.
     if is_llama_3_1_8b or is_qwen_2_5_7b:
@@ -239,6 +461,10 @@ def create_llm(model_name: str, *, temperature: float = 0.0):
     if _is_huggingface_model(model_name):
         return _create_huggingface_chat(model_str, temperature=temp)
 
+    # OpenRouter: use the dedicated integration (init_chat_model often fails for this provider).
+    if model_str.lower().startswith("openrouter:"):
+        return _create_openrouter_chat(model_str, temperature=temp)
+
     # DeepInfra is not (always) registered as an `init_chat_model` provider. Use the
     # community integration directly.
     if model_str.lower().startswith("deepinfra:"):
@@ -265,10 +491,7 @@ def create_llm(model_name: str, *, temperature: float = 0.0):
             deepinfra_api_token=api_token,
         )
 
-    try:
-        from langchain.chat_models.base import init_chat_model
-    except Exception as e:  # pragma: no cover
-        raise ImportError("Missing LangChain dependency for LLM initialization.") from e
+    init_chat_model = _get_init_chat_model()
 
     if ":" in model_str:
         provider, raw_model = (s.strip() for s in model_str.split(":", 1))
@@ -291,7 +514,8 @@ def create_llm(model_name: str, *, temperature: float = 0.0):
 
 def create_embeddings(model_name: str):
     """Create embeddings using LangChain initializers."""
-    from langchain.embeddings.base import init_embeddings
+
+    configure_hf_hub_cache()
 
     if not model_name:
         raise ValueError("embedding model name is required")
@@ -329,7 +553,7 @@ def create_embeddings(model_name: str):
 
         return FireworksEmbeddings(model=fireworks_model)
 
-    return init_embeddings(selected_model)
+    return _get_init_embeddings()(selected_model)
 
 
 def _create_snowflake_embeddings(model_name: str):

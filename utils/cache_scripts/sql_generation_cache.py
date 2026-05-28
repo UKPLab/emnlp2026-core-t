@@ -1,9 +1,9 @@
 """
-SQL generation cache.
+SQL generation caches.
 
-This is a lightweight, file-backed cache for LLM-generated SQL queries.
+It use the directory: ``cache/<dataset>/sql_generation/`` so entries are shared across selector configurations.
 
-Key format:
+SQL generation key format:
   <llm_name>___SQL_<db.table_db.table_...>__Q<sha256(query)>
 """
 
@@ -15,6 +15,8 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+_TABLE_ID_SEP = "#sep#"
+
 
 class SQLGenerationCache:
     """Persistent cache for generated SQL."""
@@ -23,7 +25,7 @@ class SQLGenerationCache:
         if cache_dir is None:
             from utils import Configuration  # local package import
 
-            cache_dir = Configuration().get_database_cache_dir("sql_generation")
+            cache_dir = Configuration().get_dataset_cache_dir("sql_generation")
 
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
@@ -54,8 +56,8 @@ class SQLGenerationCache:
         table_names: List[str] = []
         for table in tables or []:
             s = str(table or "").strip()
-            if "#sep#" in s:
-                db_id, table_name = s.split("#sep#", 1)
+            if _TABLE_ID_SEP in s:
+                db_id, table_name = s.split(_TABLE_ID_SEP, 1)
                 table_names.append(f"{db_id.strip().lower()}.{table_name.strip().lower()}")
             else:
                 table_names.append(s.lower())
@@ -170,17 +172,173 @@ class SQLGenerationCache:
         self._save_cache()
 
 
+class SQLExecutionCache:
+    """Persistent cache for ``execute_sql_on_attached_tables`` outcomes (rows / errors)."""
+
+    def __init__(self, cache_dir: Optional[str] = None) -> None:
+        if cache_dir is None:
+            from utils import Configuration  # local package import
+
+            cache_dir = Configuration().get_dataset_cache_dir("sql_generation")
+
+        self.cache_dir = Path(cache_dir)
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.cache_file = self.cache_dir / "sql_execution_cache.json"
+        self.exec_cache: Dict[str, Dict[str, Any]] = {}
+        self._load_cache()
+
+    @staticmethod
+    def _dataset_key_component(dataset: str) -> str:
+        """Filesystem-safe-ish token, same spirit as SQL generation's cleaned LLM name."""
+        return (
+            str(dataset or "unknown")
+            .strip()
+            .lower()
+            .replace("/", "_")
+            .replace("-", "_")
+            .replace(".", "_")
+        )
+
+    @staticmethod
+    def _table_part_from_full_ids(table_full_ids: List[str]) -> str:
+        """Match SQL generation: preserve order, normalize ``db#sep#table`` → ``db.table``."""
+        table_names: List[str] = []
+        for table in table_full_ids or []:
+            s = str(table or "").strip()
+            if not s:
+                continue
+            if _TABLE_ID_SEP in s:
+                db_id, table_name = s.split(_TABLE_ID_SEP, 1)
+                table_names.append(f"{db_id.strip().lower()}.{table_name.strip().lower()}")
+            else:
+                table_names.append(s.lower())
+        return "_".join(table_names)
+
+    @staticmethod
+    def make_cache_key(
+        *,
+        sql: str,
+        table_full_ids: List[str],
+        alias_to_full_id: Optional[Dict[str, str]],
+        row_limit: Optional[int],
+        timeout_seconds: int,
+        dataset: str,
+    ) -> str:
+        ds = SQLExecutionCache._dataset_key_component(dataset)
+        table_part = SQLExecutionCache._table_part_from_full_ids(table_full_ids)
+        sql_hash = hashlib.sha256(str(sql).encode("utf-8")).hexdigest()
+        if alias_to_full_id:
+            alias_items = sorted((str(k), str(v)) for k, v in alias_to_full_id.items())
+            alias_canon = json.dumps(alias_items, ensure_ascii=False, separators=(",", ":"))
+            alias_hash = hashlib.sha256(alias_canon.encode("utf-8")).hexdigest()
+        else:
+            alias_hash = hashlib.sha256(b"").hexdigest()
+        rl_token = "none" if row_limit is None else str(int(row_limit))
+        to_token = str(int(timeout_seconds))
+        return f"{ds}___EXEC_{table_part}__S{sql_hash}__A{alias_hash}__RL{rl_token}__TO{to_token}"
+
+    def _load_cache(self) -> None:
+        if not self.cache_file.exists():
+            self.exec_cache = {}
+            return
+        try:
+            with self.cache_file.open("r", encoding="utf-8") as f:
+                payload = json.load(f)
+            self.exec_cache = payload if isinstance(payload, dict) else {}
+        except Exception:
+            self.exec_cache = {}
+
+    def _save_cache(self) -> None:
+        tmp = self.cache_file.with_suffix(".tmp")
+        try:
+            with tmp.open("w", encoding="utf-8") as f:
+                json.dump(self.exec_cache, f, indent=2, ensure_ascii=False, default=str)
+            tmp.replace(self.cache_file)
+        except Exception:
+            try:
+                if tmp.exists():
+                    tmp.unlink()
+            except Exception:
+                pass
+
+    def get_execution(
+        self,
+        *,
+        sql: str,
+        table_full_ids: List[str],
+        alias_to_full_id: Optional[Dict[str, str]],
+        row_limit: Optional[int],
+        timeout_seconds: int,
+        dataset: str,
+    ) -> Optional[Dict[str, Any]]:
+        key = self.make_cache_key(
+            sql=sql,
+            table_full_ids=table_full_ids,
+            alias_to_full_id=alias_to_full_id,
+            row_limit=row_limit,
+            timeout_seconds=timeout_seconds,
+            dataset=dataset,
+        )
+        entry = self.exec_cache.get(key)
+        return dict(entry) if isinstance(entry, dict) else None
+
+    def set_execution(
+        self,
+        *,
+        sql: str,
+        table_full_ids: List[str],
+        alias_to_full_id: Optional[Dict[str, str]],
+        row_limit: Optional[int],
+        timeout_seconds: int,
+        dataset: str,
+        success: bool,
+        rows: List[Dict[str, Any]],
+        duplicates_skipped: bool,
+        error: Optional[str],
+    ) -> None:
+        key = self.make_cache_key(
+            sql=sql,
+            table_full_ids=table_full_ids,
+            alias_to_full_id=alias_to_full_id,
+            row_limit=row_limit,
+            timeout_seconds=timeout_seconds,
+            dataset=dataset,
+        )
+        self.exec_cache[key] = {
+            "success": bool(success),
+            "rows": list(rows or []),
+            "duplicates_skipped": bool(duplicates_skipped),
+            "error": error,
+            "row_count": int(len(rows or [])),
+            "execution_timestamp": float(time.time()),
+            "sql_preview": (sql[:200] + "...") if len(sql) > 200 else sql,
+        }
+        self._save_cache()
+
+
 _sql_cache_instances: Dict[str, SQLGenerationCache] = {}
+_exec_cache_instances: Dict[str, SQLExecutionCache] = {}
 
 
 def get_sql_generation_cache(cache_dir: Optional[str] = None) -> SQLGenerationCache:
     if cache_dir is None:
         from utils import Configuration  # local package import
 
-        cache_dir = Configuration().get_database_cache_dir("sql_generation")
+        cache_dir = Configuration().get_dataset_cache_dir("sql_generation")
 
     abs_dir = str(Path(cache_dir).resolve())
     if abs_dir not in _sql_cache_instances:
         _sql_cache_instances[abs_dir] = SQLGenerationCache(abs_dir)
     return _sql_cache_instances[abs_dir]
 
+
+def get_sql_execution_cache(cache_dir: Optional[str] = None) -> SQLExecutionCache:
+    if cache_dir is None:
+        from utils import Configuration  # local package import
+
+        cache_dir = Configuration().get_dataset_cache_dir("sql_generation")
+
+    abs_dir = str(Path(cache_dir).resolve())
+    if abs_dir not in _exec_cache_instances:
+        _exec_cache_instances[abs_dir] = SQLExecutionCache(abs_dir)
+    return _exec_cache_instances[abs_dir]

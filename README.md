@@ -12,22 +12,19 @@
   <img src="assets/assumption.png" style="width:50%">
 <p align="center">
 
-Realistic text-to-SQL workflows often require joining multiple tables. As a result, accurately retrieving the relevant set of tables becomes a key bottleneck for end-to-end performance. We study an open-book setting where queries must be answered over large, heterogeneous table collections pooled from many sources, without clean scoping signals such as database identifiers. Here, dense retrieval (DR) achieves high recall but returns many distractors, while join-aware alternatives often rely on extra assumptions and/or incur high inference overhead. We propose CORE-T, a scalable, training-free framework that enriches tables with LLM-generated purpose metadata and pre-computes a lightweight table-compatibility cache. At inference time, DR returns top-K candidates; a single LLM call selects a coherent, joinable subset, and a simple additive adjustment step restores strongly compatible tables. Across BIRD, SPIDER, and MMQA, CORE-T improves table-selection F1 by up to 22.7 points while retrieving up to 42% fewer tables, improving multi-table execution accuracy by up to 5.0 points on BIRD and 6.9 points on MMQA, and using 4–5× fewer tokens than LLM-intensive baselines.
-
-<p align="center">
-  <img src="assets/pipeline.png" style="width:50%">
-<p align="center">
+Realistic text-to-SQL workloads often require joining multiple tables. As a result, accurately retrieving the relevant set of tables becomes a key bottleneck for end-to-end performance. We study an open-book setting where queries must be answered over large, heterogeneous table collections pooled from many sources, without clean scoping signals such as database identifiers. Here, dense retrieval (DR) achieves high recall but returns many distractors, while join-aware alternatives often rely on extra assumptions and/or incur high inference overhead. We propose CORE-T, a scalable, training-free framework that enriches tables with LLM-generated purpose metadata and pre-computes a lightweight table-compatibility cache. At inference time, DR returns top-K candidates; a single LLM call selects a coherent, joinable subset, and a simple additive adjustment step restores strongly compatible tables. Across Bird, Spider, MMQA, and Beaver, CORE-T improves over DR by up to 22.7 points in table-selection F1 while returning up to 40% fewer tables, and by up to 24.4 points in multi-table execution accuracy, and uses 1.64–4.20× fewer total selection tokens than LLM-intensive baselines.
 
 ---
 
 CORE-T is a **multi-table text-to-SQL pipeline** built around:
 
 - **Offline preprocessing** of tables (markdown previews)
-- **Table metadata generation** (LLM-generated purpose/summary/QA)
+- **Table metadata generation** (LLM-generated purpose metadata)
 - **Pairwise table compatibility** estimation (joinability signals)
 - **Dense retrieval** (FAISS) to get candidate tables per question
 - **LLM-based table selection** (choose a coherent subset of joinable tables)
-- **LLM SQL generation** (SQLite dialect) conditioned on schemas
+- **Table augmentation** (compatablility-based neighbor addition + seeded expansion over the top-K pool)
+- **LLM SQL generation** (SQLite dialect) conditioned on augmented table sets
 - **Execution + evaluation** against gold execution results
 
 This repository contains the code used to run the pipeline and reproduce the experiments in the paper.
@@ -44,13 +41,8 @@ Contact person: [Hassan Soliman](mailto:hassan.soliman@tu-darmstadt.de)
 CORE-T/
 ├── .gitignore
 ├── LICENSE.txt
-├── NOTICE.txt
 ├── README.md
 ├── requirements.txt
-│
-├── assets/                             # Figures used in the README
-│   ├── intro.png
-│   └── pipeline.png
 │
 ├── offline_preprocessing/              # Offline preprocessing components
 │   ├── table_preprocessor.py           # Table markdown preprocessing
@@ -58,8 +50,9 @@ CORE-T/
 │   ├── compatibility_calculator.py     # Pairwise table compatibility
 │
 ├── dense_retriever.py                  # FAISS dense table retrieval
-├── table_selector.py                   # LLM table selection (+ augmentation)
-├── sql_generator.py                    # SQL generation conditioned on selected tables
+├── table_selector.py                   # LLM table selection (coherent subset per query)
+├── table_augmentor.py                  # Compatability-based augmentation + seeded expansion
+├── sql_generator.py                    # SQL generation conditioned on augmented tables
 ├── sql_executor.py                     # Execute generated SQLs against SQLite databases
 │
 ├── evaluate_tables.py                  # Evaluate retrieved/selected tables vs gold
@@ -75,16 +68,17 @@ We run experiments on **three text-to-SQL benchmarks**:
 - **BIRD**
 - **SPIDER**
 - **MMQA**
+- **BEAVER**
 
-We preprocessed these datasets to follow our open-book setting by merging tables from
-multiple DBs (or question-specific schemas for MMQA) into a single retrieval corpus per benchmark. For convenience, we provide the required preprocessed `data/` and `sql_database/` folders (and an optional `cache/` folder) in a single download:
+We preprocessed BIRD, SPIDER, and MMQA for our open-book setting by merging tables from
+multiple DBs (or question-specific schemas for MMQA) into a single retrieval corpus per benchmark. **BEAVER** is already released in an open-book form and did not require this merging step. For convenience, we provide the required preprocessed `data/` and `sql_database/` folders (and an optional `cache/` folder) in a single download:
 
 - You can access the datasets by following this [link](https://tudatalib.ulb.tu-darmstadt.de/handle/tudatalib/4993).
 
 After downloading, extract the archive into the repository root so you get:
 
 ```text
-data/<dataset>/...
+data/<dataset>/...                 # bird | spider | mmqa | beaver
 sql_database/<dataset>/...
 cache/<dataset>/<run_tag>/...    # optional: offline preprocessing artifacts
 ```
@@ -117,7 +111,7 @@ uv pip install -r requirements.txt
 
 #### 1) Dataset files (`data/`)
 
-Scripts assume the following dataset layout:
+Scripts assume the following dataset layout (`<dataset>` is one of `bird`, `spider`, `mmqa`, or `beaver`):
 
 ```
 data/
@@ -134,17 +128,8 @@ The executor and preprocessing steps require SQLite database files under:
 
 ```
 sql_database/
-└── bird/
-    ├── <db_id>/<db_id>.sqlite    # Bird-style nested dbs
-    └── ...
-```
-
-For Spider-style layouts, the code also supports:
-
-```
-sql_database/
-└── spider/
-    ├── <db_id>.sqlite            # Spider-style flat dbs
+└── <dataset>/                    # bird | spider | mmqa | beaver
+    ├── <db_id>/<db_id>.sqlite
     └── ...
 ```
 
@@ -261,9 +246,39 @@ results/<dataset>/<run_tag>/results_table_selection/
 
 Useful options:
 - `--partition / --num-partitions`: split work across machines; produces partitioned `selected_tables_<p>_of_<n>.json`
-- `--threshold`: controls augmentation sensitivity
 
-### 4) SQL generation (LLM generates SQLite SQL per question)
+Also uses a persistent table selection cache:
+
+```
+cache/<dataset>/<run_tag>/selections/selection_decisions.json
+```
+
+### 4) Table augmentation (compaability-based neighbors + seeded expansion)
+
+For each query it does the following:
+
+1. **Initial augmentation** — add strongly compatible neighbors above `--initial-augment-threshold`, which is the compatibility cutoff for initial augmentation (default `0.5`)
+2. **Seeded expansion** — greedily grow the set using compatibility and normalized retrieval scores (up to `--expansion-max-size`, defaulting to `--top-k`)
+
+```bash
+python table_augmentor.py \
+  --dataset bird \
+  --llm-model "huggingface:Qwen/Qwen2.5-7B-Instruct" \
+  --embedding-model "fireworks:WhereIsAI/UAE-Large-V1" \
+  --top-k 10
+```
+
+Writes:
+
+```
+results/<dataset>/<run_tag>/results_table_augmentation/
+├── augmented_tables.json                  # final set used by sql_generator.py
+├── augmented_tables_details.json
+```
+
+### 5) SQL generation (LLM generates SQLite SQL per question)
+
+By default, reads augmented tables from `results_table_augmentation/augmented_tables.json`
 
 ```bash
 python sql_generator.py \
@@ -284,10 +299,10 @@ results/<dataset>/<run_tag>/results_sql_generation/
 Also uses a persistent SQL cache:
 
 ```
-cache/<dataset>/<run_tag>/sql_generation/sql_generation_cache.json
+cache/<dataset>/sql_generation/sql_generation_cache.json
 ```
 
-### 5) SQL execution (run and execute generated SQLs)
+### 6) SQL execution (run and execute generated SQLs)
 
 ```bash
 python sql_executor.py \
@@ -304,9 +319,9 @@ results/<dataset>/<run_tag>/results_sql_generation/
 └── sqls_exec_details.json
 ```
 
-### 6) Evaluation
+### 7) Evaluation
 
-#### 6.1 Table evaluation (retrieved vs selected)
+#### 7.1 Table evaluation (retrieved vs selected vs augmented)
 
 Evaluate dense retriever outputs:
 
@@ -329,7 +344,17 @@ python evaluate_tables.py \
   --embedding-model "fireworks:WhereIsAI/UAE-Large-V1"
 ```
 
-#### 6.2 SQL execution evaluation (rows vs gold)
+Evaluate augmented tables (after `table_augmentor.py`):
+
+```bash
+python evaluate_tables.py \
+  --dataset bird \
+  --mode augmented \
+  --llm-model "huggingface:Qwen/Qwen2.5-7B-Instruct" \
+  --embedding-model "fireworks:WhereIsAI/UAE-Large-V1"
+```
+
+#### 7.2 SQL execution evaluation (rows vs gold)
 
 ```bash
 python evaluate_sqls.py \
@@ -351,16 +376,19 @@ data/<dataset>/dev_query_results.json
 After running the full pipeline for one `(dataset, llm-model, embedding-model)` run tag, you should see these main artifacts and results:
 
 ```
-cache/<dataset>/<run_tag>/
+cache/<dataset>/<run_tag>/              # scoped to (llm-model, embedding-model)
 ├── preprocessed_tables/
 ├── metadata/
 ├── compatibility/
 ├── selections/
-└── sql_generation/
+└── faiss_vectors/                      
+
+cache/<dataset>/sql_generation/         # shared across runs (no run tag)
 
 results/<dataset>/<run_tag>/
 ├── results_dense_retriever/
 ├── results_table_selection/
+├── results_table_augmentation/
 └── results_sql_generation/
 ```
 

@@ -2,7 +2,7 @@
 Metadata cache.
 
 This is a lightweight, file-backed cache for table-level metadata produced by
-offline preprocessing (e.g., table purpose/summary/QA pairs/enriched tables).
+offline preprocessing (e.g., table purpose/enriched tables).
 
 Storage:
   cache/<dataset>/metadata/<metadata_type>/<db_id>#sep#<table_name>.json

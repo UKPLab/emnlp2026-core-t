@@ -8,7 +8,6 @@ Inputs:
 
 Outputs:
   - Cached preprocessed tables (markdown) in the cache directory
-  - Optional column value hints if `--cache-column-hints` is set
 
 Usage:
   python offline_preprocessing/table_preprocessor.py --dataset bird --embedding-model "fireworks:WhereIsAI/UAE-Large-V1" --llm-model "huggingface:Qwen/Qwen2.5-7B-Instruct"

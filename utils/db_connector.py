@@ -1,7 +1,7 @@
-"""SQLite database access utilities for MAJOR-T.
+"""SQLite database access utilities for CORE-T.
 
 Centralizes all direct interactions with the benchmark SQLite databases
-(Spider | BIRD | MMQA):
+(Spider | BIRD | MMQA | BEAVER):
 - Resolve database file paths from configured dataset type
 - Open connections and run raw SQL
 - Inspect table schemas and foreign-key relationships
@@ -269,8 +269,8 @@ def get_database_schema(db_name: str, config: Optional['Configuration'] = None) 
     conn = get_connection(db_name, config)
     cursor = conn.cursor()
     
-    # Get all table names (exclude SQLite internal tables for BIRD)
-    if config.database_type in [DatabaseType.BIRD]:
+    # Get all table names (exclude SQLite internal tables for BIRD and BEAVER)
+    if config.database_type in [DatabaseType.BIRD, DatabaseType.BEAVER]:
         cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%';")
     else:
         cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")

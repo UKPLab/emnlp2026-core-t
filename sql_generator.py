@@ -3,7 +3,7 @@
 SQL generator.
 
 This script reads a dataset file with questions (e.g., data/bird/dev.json)
-and a per-question list of selected tables (e.g., results/.../selected_tables.json),
+and a per-question list of tables (e.g., results/<dataset>/<run_tag>/results_table_augmentation/augmented_tables.json),
 then generates one SQLite SQL query per question using an LLM.
 
 Usage:
@@ -43,7 +43,13 @@ try:
 except Exception:
     pass
 
-from utils import DatabaseType, Configuration, create_llm, get_results_run_dir  # noqa: E402
+from utils import (  # noqa: E402
+    DatabaseType,
+    Configuration,
+    create_llm,
+    get_results_run_dir,
+    summarize_llm_invoke_error,
+)
 from utils.db_connector import get_database_schema, get_table_relationships  # noqa: E402
 from utils.prompts import get_sql_generation_prompt_lrm  # noqa: E402
 from utils.storage_manager import UnifiedStorageManager  # noqa: E402
@@ -268,7 +274,7 @@ def _invoke_llm(model, prompt: str):
 
             return model.invoke([HumanMessage(content=prompt)])
         except Exception as e:
-            raise RuntimeError(f"Failed to invoke LLM: {e}") from e
+            raise RuntimeError(f"Failed to invoke LLM: {summarize_llm_invoke_error(e)}") from e
 
 
 def _llm_usage_from_message(ai_message: Any) -> Dict[str, Any]:
@@ -436,7 +442,7 @@ def generate_sql_for_question(
     # Cache lookup (keyed by question + selected tables + sql model).
     # Cache is stored under: cache/<dataset>/sql_generation/sql_generation_cache.json
     try:
-        sql_cache = get_sql_generation_cache(config.get_database_cache_dir("sql_generation"))
+        sql_cache = get_sql_generation_cache(config.get_dataset_cache_dir("sql_generation"))
         cached = sql_cache.get_sql(question, selected_tables, config, llm_model_override=str(sql_model_name))
     except Exception:
         cached = None
@@ -495,7 +501,7 @@ def generate_sql_for_question(
                 "cache_hit": False,
             }
             try:
-                sql_cache = get_sql_generation_cache(config.get_database_cache_dir("sql_generation"))
+                sql_cache = get_sql_generation_cache(config.get_dataset_cache_dir("sql_generation"))
                 sql_cache.set_sql(question, selected_tables, result, config, llm_model_override=str(sql_model_name))
             except Exception:
                 pass
@@ -523,7 +529,7 @@ def generate_sql_for_question(
             "cache_hit": False,
         }
         try:
-            sql_cache = get_sql_generation_cache(config.get_database_cache_dir("sql_generation"))
+            sql_cache = get_sql_generation_cache(config.get_dataset_cache_dir("sql_generation"))
             sql_cache.set_sql(question, selected_tables, result, config, llm_model_override=str(sql_model_name))
         except Exception:
             pass
@@ -546,7 +552,7 @@ def generate_sql_for_question(
             "cache_hit": False,
         }
         try:
-            sql_cache = get_sql_generation_cache(config.get_database_cache_dir("sql_generation"))
+            sql_cache = get_sql_generation_cache(config.get_dataset_cache_dir("sql_generation"))
             sql_cache.set_sql(question, selected_tables, result, config, llm_model_override=str(sql_model_name))
         except Exception:
             pass
@@ -563,7 +569,7 @@ def _coerce_selected_tables(payload: Any) -> List[List[str]]:
             continue
         if isinstance(entry, dict):
             # tolerate details-like structures
-            for key in ("selected_tables", "tables"):
+            for key in ("selected_tables", "augmented_tables", "tables"):
                 if isinstance(entry.get(key), list):
                     out.append([_normalize_table_id(x) for x in entry.get(key, []) if _normalize_table_id(x)])
                     break
@@ -577,8 +583,9 @@ def _coerce_selected_tables(payload: Any) -> List[List[str]]:
 def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description=(
-            "Generate SQLite SQL queries from (question, selected tables) pairs. "
-            "The selected tables input is typically the output of table_selector.py."
+            "Generate SQLite SQL queries from (question, table list) pairs. "
+            "The default tables input is augmented_tables.json from table_augmentor.py "
+            "(override with --selected-tables)."
         )
     )
     p.add_argument(
@@ -591,7 +598,7 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         "--selected-tables",
         type=str,
         default=None,
-        help="Path to selected tables JSON (defaults to results/<dataset>/{llm}_{embedding_model}/results_table_selection/selected_tables.json).",
+        help="Path to per-question table lists JSON (defaults to results/<dataset>/{llm}_{embedding_model}/results_table_augmentation/augmented_tables.json).",
     )
     p.add_argument(
         "--enriched-tables",
@@ -665,12 +672,12 @@ def main(args: argparse.Namespace) -> int:
     else:
         run_dir = get_results_run_dir(
             dataset=str(config.database_type.value),
-            step_dirname="results_table_selection",
+            step_dirname="results_table_augmentation",
             llm_model=str(config.llm_model),
             embedding_model=str(config.embedding_model),
             project_root=PROJECT_ROOT,
         )
-        selected_tables_path = (run_dir / "selected_tables.json").resolve()
+        selected_tables_path = (run_dir / "augmented_tables.json").resolve()
 
     if args.enriched_tables:
         enriched_dir = Path(args.enriched_tables).expanduser().resolve()
@@ -681,7 +688,7 @@ def main(args: argparse.Namespace) -> int:
         print(f"❌ Data file not found: {data_path}")
         return 1
     if not selected_tables_path.exists():
-        print(f"❌ Selected-tables file not found: {selected_tables_path}")
+        print(f"❌ Tables input file not found: {selected_tables_path}")
         return 1
     if not enriched_dir.exists():
         print(f"❌ Enriched-tables directory not found: {enriched_dir}")
@@ -701,7 +708,7 @@ def main(args: argparse.Namespace) -> int:
     selected_payload = _read_json(selected_tables_path)
     selected_tables_per_q = _coerce_selected_tables(selected_payload)
     if not selected_tables_per_q:
-        print("❌ No selected tables found in --selected-tables.")
+        print("❌ No table lists found in the tables input JSON.")
         return 1
 
     n = min(len(questions), len(selected_tables_per_q))

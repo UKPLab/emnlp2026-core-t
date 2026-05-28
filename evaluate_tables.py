@@ -5,6 +5,8 @@ Evaluate table predictions against gold tables.
 You can evaluate ONE file at a time:
   - dense retriever output  (--mode retrieved)
   - table selector output  (--mode selected)
+  - augmented tables output  (--mode augmented)
+  - custom input (--mode custom + --custom-data-path pointing to the prediction JSON file; eval outputs go next to it)
 
 Usage:
     python evaluate_tables.py --dataset bird --mode retrieved --llm-model "huggingface:Qwen/Qwen2.5-7B-Instruct" --embedding-model "fireworks:WhereIsAI/UAE-Large-V1"
@@ -324,7 +326,7 @@ def _coerce_predictions(payload: Any) -> List[List[str]]:
             out.append([t for t in pred_list if t])
             continue
         if isinstance(entry, dict):
-            for key in ("selected_tables", "retrieved_tables", "tables"):
+            for key in ("selected_tables", "retrieved_tables", "augmented_tables", "tables"):
                 if isinstance(entry.get(key), list):
                     pred_list = [_normalize_table_id(x) for x in entry.get(key, [])]
                     out.append([t for t in pred_list if t])
@@ -415,6 +417,25 @@ def _evaluate(preds: List[List[str]], golds: List[List[str]]) -> Tuple[Dict[str,
     return summary, per_query
 
 
+def _infer_mode_from_prediction_path(pred_path: Path) -> str:
+    """
+    Guess artifact type from filename for metrics branches (partition merge, selection usage).
+
+    Defaults to ``retrieved`` when the name is ambiguous.
+    """
+    stem_l = pred_path.stem.lower()
+    name_l = pred_path.name.lower()
+    if name_l == "selected_tables.json" or stem_l.startswith("selected_tables"):
+        return "selected"
+    if name_l == "augmented_tables.json" or stem_l.startswith("augmented_tables"):
+        return "augmented"
+    # Dense retriever convention: <dataset>_k_<int>.json
+    parts = stem_l.split("_k_")
+    if len(parts) == 2 and parts[1].isdigit():
+        return "retrieved"
+    return "retrieved"
+
+
 def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Evaluate predicted tables against gold tables (one input file at a time).")
     p.add_argument(
@@ -442,9 +463,17 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument(
         "--mode",
         type=str,
-        choices=["retrieved", "selected"],
+        choices=["retrieved", "selected", "augmented", "custom"],
         default="retrieved",
-        help="Which prediction artifact to evaluate when no explicit --retrieved/--selected path is provided.",
+        help="Which prediction artifact to evaluate when no explicit --retrieved/--selected/--augmented path is provided. "
+        "Use 'custom' with --custom-data-path set to the prediction JSON file (eval outputs are written next to it).",
+    )
+    p.add_argument(
+        "--custom-data-path",
+        type=str,
+        default=None,
+        help="Required with --mode custom: path to the prediction JSON file to evaluate. "
+        "Default eval_summary.json / eval_details.json are written in the same directory.",
     )
     p.add_argument(
         "--top-k",
@@ -471,6 +500,12 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         default=None,
         help="Table selector output JSON (list[list[str]]).",
     )
+    group.add_argument(
+        "--augmented",
+        type=str,
+        default=None,
+        help="Table augmentor output JSON (list[list[str]]), e.g. augmented_tables.json.",
+    )
     p.add_argument("--out", type=str, default=None, help="Optional path to write a JSON summary report.")
     p.add_argument("--out-details", type=str, default=None, help="Optional path to write per-query details (can be large).")
     p.add_argument(
@@ -495,12 +530,29 @@ def main(args: argparse.Namespace) -> int:
 
     mode: str
     pred_path: Path
-    if args.retrieved:
+    cli_mode = str(args.mode or "retrieved")
+
+    if cli_mode == "custom":
+        if not args.custom_data_path:
+            print("❌ --mode custom requires --custom-data-path (path to the prediction JSON file).")
+            return 1
+        pred_path = Path(args.custom_data_path).expanduser().resolve()
+        if pred_path.is_dir():
+            print(f"❌ --custom-data-path must be a JSON file, not a directory: {pred_path}")
+            return 1
+        if pred_path.suffix.lower() != ".json":
+            print(f"❌ --custom-data-path must be a .json file: {pred_path}")
+            return 1
+        mode = _infer_mode_from_prediction_path(pred_path)
+    elif args.retrieved:
         mode = "retrieved"
         pred_path = Path(args.retrieved).expanduser().resolve()
     elif args.selected:
         mode = "selected"
         pred_path = Path(args.selected).expanduser().resolve()
+    elif args.augmented:
+        mode = "augmented"
+        pred_path = Path(args.augmented).expanduser().resolve()
     else:
         mode = str(args.mode or "retrieved")
         if mode == "retrieved":
@@ -512,6 +564,15 @@ def main(args: argparse.Namespace) -> int:
                 project_root=PROJECT_ROOT,
             )
             pred_path = (run_dir / f"{dataset}_k_{int(args.top_k)}.json").resolve()
+        elif mode == "augmented":
+            run_dir = get_results_run_dir(
+                dataset=str(dataset),
+                step_dirname="results_table_augmentation",
+                llm_model=str(args.llm_model),
+                embedding_model=str(args.embedding_model),
+                project_root=PROJECT_ROOT,
+            )
+            pred_path = (run_dir / "augmented_tables.json").resolve()
         else:
             run_dir = get_results_run_dir(
                 dataset=str(dataset),
@@ -563,6 +624,9 @@ def main(args: argparse.Namespace) -> int:
         "gold_path": str(gold_path),
         **summary,
     }
+    if cli_mode == "custom":
+        report["layout"] = "custom"
+        report["custom_data_path"] = str(pred_path)
 
     # Extra high-signal summary metrics.
     report["avg_pred_tables"] = _avg_table_count(preds)
@@ -620,17 +684,27 @@ def main(args: argparse.Namespace) -> int:
         }
 
     # Default output folder:
-    # - If caller provided --retrieved/--selected, write next to that file (same folder).
+    # - If caller provided --out, use that path.
+    # - If --mode custom, write next to the custom prediction JSON.
+    # - If caller provided --retrieved/--selected/--augmented (non-custom), write next to that file (same folder).
     # - Otherwise, write under the computed run folder.
     if args.out:
         out_path = Path(args.out).expanduser().resolve()
-    elif args.retrieved or args.selected:
+    elif cli_mode == "custom":
+        out_path = (pred_path.parent / "eval_summary.json").resolve()
+    elif args.retrieved or args.selected or args.augmented:
         out_path = (pred_path.parent / "eval_summary.json").resolve()
     else:
+        if mode == "retrieved":
+            step_dirname = "results_dense_retriever"
+        elif mode == "augmented":
+            step_dirname = "results_table_augmentation"
+        else:
+            step_dirname = "results_table_selection"
         out_path = (
             get_results_run_dir(
                 dataset=str(dataset),
-                step_dirname=("results_dense_retriever" if mode == "retrieved" else "results_table_selection"),
+                step_dirname=step_dirname,
                 llm_model=str(args.llm_model),
                 embedding_model=str(args.embedding_model),
                 project_root=PROJECT_ROOT,

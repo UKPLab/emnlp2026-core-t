@@ -9,6 +9,7 @@ Inputs:
 
 Outputs:
   - Cached metadata under `cache/{dataset}/metadata/`
+  - Per-run LLM usage JSON: `cache/<dataset>/{llm}_{embedding}/metadata/metadata_llm_usage.json`
 
 Usage:
   python offline_preprocessing/metadata_generator.py --dataset bird --embedding-model "fireworks:WhereIsAI/UAE-Large-V1" --llm-model "huggingface:Qwen/Qwen2.5-7B-Instruct"
@@ -19,6 +20,7 @@ import json
 import re
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -40,7 +42,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 load_dotenv(PROJECT_ROOT / ".env")
 
-from utils import Configuration, DatabaseType
+from utils import Configuration, DatabaseType, llm_usage_from_prompt_and_output
 from utils.db_connector import get_database_schema
 from utils.cache_scripts.metadata_cache import get_metadata_cache
 from utils.prompts import purpose_prompt, qa_prompt, summary_prompt
@@ -48,6 +50,47 @@ from utils.storage_manager import UnifiedStorageManager, get_unified_storage_man
 
 
 TABLE_ID_SEPARATOR = "#sep#"
+
+METADATA_LLM_USAGE_FILENAME = "metadata_llm_usage.json"
+
+
+def _aggregate_llm_usage_records(records: List[Dict[str, Any]]) -> Dict[str, Any]:
+    total_in = 0.0
+    total_out = 0.0
+    total_all = 0.0
+    total_cost = 0.0
+    for rec in records or []:
+        u = rec.get("llm_usage") if isinstance(rec.get("llm_usage"), dict) else {}
+        try:
+            total_in += float(u.get("input_tokens") or 0)
+        except Exception:
+            pass
+        try:
+            total_out += float(u.get("output_tokens") or 0)
+        except Exception:
+            pass
+        try:
+            total_all += float(u.get("total_tokens") or 0)
+        except Exception:
+            pass
+        try:
+            total_cost += float(u.get("cost_usd") or 0)
+        except Exception:
+            pass
+    n = len(records or [])
+    return {
+        "n_llm_calls": n,
+        "input_tokens": total_in,
+        "output_tokens": total_out,
+        "total_tokens": total_all,
+        "cost_usd": total_cost,
+        "averages": {
+            "input_tokens": total_in / n if n else 0.0,
+            "output_tokens": total_out / n if n else 0.0,
+            "total_tokens": total_all / n if n else 0.0,
+            "cost_usd": total_cost / n if n else 0.0,
+        },
+    }
 
 
 def _content_to_text(content: Any) -> str:
@@ -203,6 +246,7 @@ class MetadataGenerator:
         self.generate_summary = bool(generate_summary)
         self.generate_qa = bool(generate_qa)
         self._model = None
+        self._llm_usage_records: List[Dict[str, Any]] = []
 
     def _get_model(self):
         if self._model is None:
@@ -234,9 +278,12 @@ class MetadataGenerator:
 
         return loaded, missing
 
-    def _enrich_preprocessed_tables(self, preprocessed_tables: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        model = self._get_model()
+    def _enrich_preprocessed_tables(
+        self, preprocessed_tables: List[Dict[str, Any]]
+    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        model = None
         enriched_tables: List[Dict[str, Any]] = []
+        usage_records: List[Dict[str, Any]] = []
 
         for pre in preprocessed_tables:
             table_markdown = pre.get("markdown_content", "")
@@ -254,8 +301,23 @@ class MetadataGenerator:
 
             purpose = self.cache.get_metadata(table_markdown, "purpose", db_id=db_id, table_name=table_name)
             if self.generate_purpose and purpose is None:
-                resp = model.invoke(self.config.format_prompt(purpose_prompt.format(table=table_markdown)))
-                purpose_text = _strip_thinking(_content_to_text(resp)).strip()
+                if model is None:
+                    model = self._get_model()
+                prompt_f = self.config.format_prompt(purpose_prompt.format(table=table_markdown))
+                resp = model.invoke(prompt_f)
+                raw_out = _content_to_text(resp)
+                usage_records.append(
+                    {
+                        "db_id": db_id,
+                        "table_name": table_name,
+                        "field": "purpose",
+                        "llm_model": self.config.llm_model,
+                        "llm_usage": llm_usage_from_prompt_and_output(
+                            model, prompt_f, raw_out, ai_message=resp, cost_usd=0.0
+                        ),
+                    }
+                )
+                purpose_text = _strip_thinking(raw_out).strip()
                 if purpose_text.lower() == "none":
                     purpose_text = None
                 self.cache.set_metadata(table_markdown, "purpose", purpose_text, db_id=db_id, table_name=table_name)
@@ -263,8 +325,23 @@ class MetadataGenerator:
 
             summary = self.cache.get_metadata(table_markdown, "summary", db_id=db_id, table_name=table_name)
             if self.generate_summary and summary is None:
-                resp = model.invoke(self.config.format_prompt(summary_prompt.format(table=table_markdown)))
-                summary_text = _strip_thinking(_content_to_text(resp)).strip()
+                if model is None:
+                    model = self._get_model()
+                prompt_f = self.config.format_prompt(summary_prompt.format(table=table_markdown))
+                resp = model.invoke(prompt_f)
+                raw_out = _content_to_text(resp)
+                usage_records.append(
+                    {
+                        "db_id": db_id,
+                        "table_name": table_name,
+                        "field": "summary",
+                        "llm_model": self.config.llm_model,
+                        "llm_usage": llm_usage_from_prompt_and_output(
+                            model, prompt_f, raw_out, ai_message=resp, cost_usd=0.0
+                        ),
+                    }
+                )
+                summary_text = _strip_thinking(raw_out).strip()
                 if summary_text.lower() == "none":
                     summary_text = None
                 self.cache.set_metadata(table_markdown, "summary", summary_text, db_id=db_id, table_name=table_name)
@@ -272,7 +349,22 @@ class MetadataGenerator:
 
             qa_pairs = self.cache.get_metadata(table_markdown, "qa_pairs", db_id=db_id, table_name=table_name)
             if self.generate_qa and qa_pairs is None:
-                resp = model.invoke(self.config.format_prompt(qa_prompt.format(table=table_markdown)))
+                if model is None:
+                    model = self._get_model()
+                prompt_f = self.config.format_prompt(qa_prompt.format(table=table_markdown))
+                resp = model.invoke(prompt_f)
+                raw_out = _content_to_text(resp)
+                usage_records.append(
+                    {
+                        "db_id": db_id,
+                        "table_name": table_name,
+                        "field": "qa_pairs",
+                        "llm_model": self.config.llm_model,
+                        "llm_usage": llm_usage_from_prompt_and_output(
+                            model, prompt_f, raw_out, ai_message=resp, cost_usd=0.0
+                        ),
+                    }
+                )
                 qa_pairs = _parse_json_list(resp)
                 self.cache.set_metadata(table_markdown, "qa_pairs", qa_pairs, db_id=db_id, table_name=table_name)
             if not self.generate_qa and qa_pairs is None:
@@ -289,7 +381,24 @@ class MetadataGenerator:
             self.cache.set_enriched_table(table_markdown, enriched, db_id=db_id, table_name=table_name)
             enriched_tables.append(enriched)
 
-        return enriched_tables
+        return enriched_tables, usage_records
+
+    def _persist_metadata_llm_usage(self) -> Optional[Path]:
+        """Write per-call LLM usage for this run to the metadata cache directory."""
+        meta_dir = Path(self.config.get_database_cache_dir("metadata"))
+        meta_dir.mkdir(parents=True, exist_ok=True)
+        out_path = meta_dir / METADATA_LLM_USAGE_FILENAME
+        payload: Dict[str, Any] = {
+            "llm_model": self.config.llm_model,
+            "embedding_model": self.config.embedding_model,
+            "database_type": self.database_type.value,
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "calls": list(self._llm_usage_records),
+            "totals": _aggregate_llm_usage_records(self._llm_usage_records),
+        }
+        with out_path.open("w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2, ensure_ascii=False)
+        return out_path.resolve()
 
     def enrich_batch(self, table_identifiers: List[str], *, dry_run: bool = False) -> Dict[str, Any]:
         start = time.time()
@@ -316,7 +425,8 @@ class MetadataGenerator:
             }
 
         try:
-            enriched = self._enrich_preprocessed_tables(preprocessed)
+            enriched, batch_usage = self._enrich_preprocessed_tables(preprocessed)
+            self._llm_usage_records.extend(batch_usage)
             return {
                 "total": len(table_identifiers),
                 "loaded_preprocessed": len(preprocessed),
@@ -337,6 +447,7 @@ class MetadataGenerator:
 
     def enrich_all(self, table_identifiers: List[str], *, batch_size: int, dry_run: bool = False) -> Dict[str, Any]:
         started = time.time()
+        self._llm_usage_records = []
 
         total = len(table_identifiers)
         enriched_total = 0
@@ -358,6 +469,13 @@ class MetadataGenerator:
             missing_total += batch["missing_preprocessed"]
             errors.extend(batch["errors"])
 
+        metadata_llm_usage_path: Optional[str] = None
+        if not dry_run:
+            try:
+                metadata_llm_usage_path = str(self._persist_metadata_llm_usage())
+            except Exception as e:
+                errors.append({"error": f"Failed to write {METADATA_LLM_USAGE_FILENAME}: {e}"})
+
         return {
             "total_tables": total,
             "loaded_preprocessed": loaded_total,
@@ -366,6 +484,8 @@ class MetadataGenerator:
             "errors": errors,
             "elapsed_seconds": time.time() - started,
             "metadata_cache_directory": str(self.config.get_database_cache_dir("metadata")),
+            "metadata_llm_usage_path": metadata_llm_usage_path,
+            "metadata_llm_usage_totals": _aggregate_llm_usage_records(self._llm_usage_records),
         }
 
 
@@ -434,6 +554,15 @@ def _print_summary(results: Dict[str, Any]) -> None:
     print(f"Errors: {len(results['errors'])}")
     print(f"Total Processing Time: {results['elapsed_seconds']:.2f} seconds")
     print(f"Metadata Cache Directory: {results['metadata_cache_directory']}")
+    if results.get("metadata_llm_usage_path"):
+        print(f"LLM usage log: {results['metadata_llm_usage_path']}")
+    totals = results.get("metadata_llm_usage_totals")
+    if isinstance(totals, dict) and totals.get("n_llm_calls", 0):
+        print(
+            f"LLM calls (metadata): n={totals.get('n_llm_calls')} "
+            f"tokens in/out/total={totals.get('input_tokens', 0):.0f}/"
+            f"{totals.get('output_tokens', 0):.0f}/{totals.get('total_tokens', 0):.0f}"
+        )
 
     cache_stats = results.get("metadata_cache_stats")
     if isinstance(cache_stats, dict):

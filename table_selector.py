@@ -3,11 +3,10 @@
 Table selector.
 
 This script reads dense-retriever outputs (top-K tables per query), then uses an
-LLM to choose a coherent subset of tables per query. Augmentation is enabled by default, 
-it applies the additive adjustment step to the selected tables.
+LLM to choose a coherent subset of tables per query.
 
 Usage:
-    python table_selector.py --dataset bird --llm-model "huggingface:Qwen/Qwen2.5-7B-Instruct" --embedding-model "fireworks:WhereIsAI/UAE-Large-V1" --partition 0 --num-partitions 2
+    python table_selector.py --dataset bird --llm-model "huggingface:Qwen/Qwen2.5-7B-Instruct" --embedding-model "fireworks:WhereIsAI/UAE-Large-V1"
 """
 
 from __future__ import annotations
@@ -35,7 +34,13 @@ if str(PROJECT_ROOT) not in sys.path:
 
 load_dotenv(PROJECT_ROOT / ".env")
 
-from utils import Configuration, DatabaseType, get_results_run_dir
+from utils import (
+    Configuration,
+    DatabaseType,
+    get_results_run_dir,
+    llm_usage_from_prompt_and_output,
+    summarize_llm_invoke_error,
+)
 from utils.cache_scripts.selection_cache import get_selection_cache
 from utils.prompts import get_selection_prompt_lrm_few_shot
 
@@ -318,6 +323,10 @@ def _invoke_llm(model, prompt: str):
     def _format_messages_for_model(model_name: str, system_prompt: str):
         from langchain_core.messages import SystemMessage, HumanMessage
 
+        # OpenRouter: single human turn avoids fragile system-only routing for some upstreams.
+        if getattr(model, "__class__", type(None)).__name__ == "ChatOpenRouter":
+            return [HumanMessage(content=system_prompt)]
+
         name = str(model_name or "")
         lower = name.lower()
 
@@ -358,7 +367,7 @@ def _invoke_llm(model, prompt: str):
 
                 return model.invoke([HumanMessage(content=prompt)])
             except Exception as e:
-                raise RuntimeError(f"Failed to invoke LLM: {e}") from e
+                raise RuntimeError(f"Failed to invoke LLM: {summarize_llm_invoke_error(e)}") from e
 
 
 def _augment_selected_group(
@@ -439,6 +448,45 @@ def _augment_selected_group(
     return list(selected_group) + list(aug_sorted)
 
 
+def _normalize_group_index(raw: Any, num_groups: int) -> int:
+    """Map LLM/cache `selected_group_index` to a valid index in ``[0, num_groups)``.
+
+    Models sometimes emit a list (e.g. ``[0]``) or a numeric string; treat those as
+    a single index. Out-of-range or unparsable values fall back to ``0``.
+    """
+    if num_groups <= 0:
+        return 0
+
+    def _one(v: Any) -> Optional[int]:
+        if v is None or isinstance(v, bool):
+            return None
+        if isinstance(v, int):
+            return v if 0 <= v < num_groups else None
+        if isinstance(v, float) and v == int(v) and v == v:  # not NaN
+            iv = int(v)
+            return iv if 0 <= iv < num_groups else None
+        if isinstance(v, str):
+            s = v.strip()
+            if not s:
+                return None
+            try:
+                iv = int(s)
+            except ValueError:
+                return None
+            return iv if 0 <= iv < num_groups else None
+        return None
+
+    if isinstance(raw, list):
+        for item in raw:
+            got = _one(item)
+            if got is not None:
+                return got
+        return 0
+
+    got = _one(raw)
+    return 0 if got is None else got
+
+
 def _select_tables(
     enriched_tables: List[Dict[str, Any]],
     updated_similarities: List[Dict[str, Any]],
@@ -451,7 +499,7 @@ def _select_tables(
     augment_with_compatible_tables: bool = False,
     threshold: float = 0.12,
     use_cache: bool = True,
-) -> Tuple[List[Dict[str, Any]], Dict[str, Any], List[Dict[str, Any]]]:
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any], List[Dict[str, Any]], Any]:
     # Work on local copies; do not mutate inputs.
     selected_enriched_tables: List[Optional[Dict[str, Any]]] = list(enriched_tables or [])
     selected_similarities: List[Dict[str, Any]] = list(updated_similarities or [])
@@ -472,24 +520,25 @@ def _select_tables(
 
         if augment_with_compatible_tables:
             try:
-                selected_group_index = group_selection_cached.get("selected_group_index", -1)
+                raw_cached_idx = group_selection_cached.get("selected_group_index", -1)
                 selection_reasoning = group_selection_cached.get(
                     "reasoning", cluster_summary_cached.get("selection_reasoning", "No group selection reasoning provided")
                 )
                 fallback_used = False
                 if not table_groups_cached:
                     table_groups_cached = [list(range(len(enriched_tables)))]
-                    selected_group_index = 0
                     selection_reasoning = "Cache missing groups; using all tables as fallback group"
                     fallback_used = True
 
-                if (
-                    selected_group_index is None
-                    or selected_group_index < 0
-                    or selected_group_index >= len(table_groups_cached)
+                selected_group_index = _normalize_group_index(
+                    raw_cached_idx, len(table_groups_cached)
+                )
+                if raw_cached_idx != selected_group_index and not isinstance(
+                    raw_cached_idx, (int, type(None))
                 ):
-                    print(f"⚠️  Invalid cached group index {selected_group_index}, using first group")
-                    selected_group_index = 0
+                    print(
+                        f"⚠️  Coerced cached group index {raw_cached_idx!r} → {selected_group_index}"
+                    )
 
                 selected_group = table_groups_cached[selected_group_index] if table_groups_cached else []
                 llm_selected_indices = list(selected_group) if isinstance(selected_group, list) else []
@@ -531,16 +580,29 @@ def _select_tables(
                 cluster_summary["llm_selected_table_indices"] = llm_selected_indices
                 cluster_summary["augmented_only_table_indices"] = augmented_only_indices
                 print(f"Found {len(clusters)} clusters after cache-based augmentation")
-                return clusters, cluster_summary, enriched_tables
+                return clusters, cluster_summary, enriched_tables, model
             except Exception as e:
                 print(f"⚠️  Failed to reuse cached selection for augmentation: {e}; returning cached clusters")
-                return cached_clusters, cluster_summary_cached, selected_enriched_tables
+                return cached_clusters, cluster_summary_cached, selected_enriched_tables, model
 
         print(f"Found {len(cached_clusters)} clusters from cache")
-        return cached_clusters, cluster_summary_cached, selected_enriched_tables
+        return cached_clusters, cluster_summary_cached, selected_enriched_tables, model
 
     # No cached result: ask the model to group/select tables.
     print(f"🧠 Selecting tables with the LLM for {len(selected_enriched_tables)} tables...")
+    if model is None:
+        try:
+            model = config.create_llm()
+        except ImportError as e:
+            msg = str(e)
+            # Common case: provider extras not installed (e.g., `together:` → langchain-together)
+            print("\n❌ Unable to create LLM client for the requested model.")
+            print(f"   Model: {getattr(config, 'llm_model', '')}")
+            print(f"   Error: {msg}")
+            if "langchain_together" in msg or "langchain-together" in msg:
+                print("\nInstall the missing provider package:")
+                print("  pip install -U langchain-together")
+            raise
 
     tables_content = _build_tables_content(
         selected_enriched_tables,
@@ -561,23 +623,25 @@ def _select_tables(
     prompt_content = get_selection_prompt_lrm_few_shot(query, tables_content, compatibility_analysis)
 
     # Invoke model, parse JSON
-    llm_usage = {"input_tokens": None, "output_tokens": None, "total_tokens": None}
     cost_usd = 0.0
     model_response: Optional[Dict[str, Any]] = None
+    llm_usage: Dict[str, Any] = {
+        "input_tokens": None,
+        "output_tokens": None,
+        "total_tokens": None,
+        "cost_usd": cost_usd,
+    }
 
     try:
         ai_message = _invoke_llm(model, prompt_content)
         raw_content_str = _content_to_text(getattr(ai_message, "content", ""))
-
-        # Token usage when available
-        try:
-            meta = getattr(ai_message, "response_metadata", {}) or {}
-            usage_meta = meta.get("token_usage") or getattr(ai_message, "usage_metadata", {}) or {}
-            llm_usage["input_tokens"] = usage_meta.get("input_tokens") or usage_meta.get("prompt_tokens")
-            llm_usage["output_tokens"] = usage_meta.get("output_tokens") or usage_meta.get("completion_tokens")
-            llm_usage["total_tokens"] = usage_meta.get("total_tokens")
-        except Exception:
-            pass
+        llm_usage = llm_usage_from_prompt_and_output(
+            model,
+            prompt_content,
+            raw_content_str,
+            ai_message=ai_message,
+            cost_usd=cost_usd,
+        )
 
         # Parse JSON strictly first
         try:
@@ -637,7 +701,7 @@ def _select_tables(
                 )
             except Exception:
                 pass
-        return clusters, cluster_summary, enriched_tables
+        return clusters, cluster_summary, enriched_tables, model
 
     # Process model response
     group_formation = model_response.get("group_formation", {}) or {}
@@ -656,14 +720,22 @@ def _select_tables(
         fallback_used = True
 
     group_selection = model_response.get("group_selection", {}) or {}
-    selected_group_index = group_selection.get("selected_group_index", -1)
+    raw_selected_idx = group_selection.get("selected_group_index", -1)
     selection_reasoning = group_selection.get("reasoning", "No group selection reasoning provided")
     if fallback_used:
-        selected_group_index = 0
         selection_reasoning = "LLM group formation failed, using all tables as fallback group"
 
-    if selected_group_index is None or selected_group_index < 0 or selected_group_index >= len(table_groups):
-        selected_group_index = 0
+    selected_group_index = (
+        0
+        if fallback_used
+        else _normalize_group_index(raw_selected_idx, len(table_groups))
+    )
+    if (
+        not fallback_used
+        and raw_selected_idx != selected_group_index
+        and not isinstance(raw_selected_idx, (int, type(None)))
+    ):
+        print(f"⚠️  Coerced selected_group_index {raw_selected_idx!r} → {selected_group_index}")
 
     clusters: List[Dict[str, Any]] = []
     selected_group = table_groups[selected_group_index] if table_groups else []
@@ -731,7 +803,7 @@ def _select_tables(
         except Exception as aug_e:
             print(f"⚠️  Augmentation step failed: {aug_e}")
 
-    return clusters, cluster_summary_pre, enriched_tables
+    return clusters, cluster_summary_pre, enriched_tables, model
 
 
 def validate_and_cluster_tables(
@@ -744,27 +816,16 @@ def validate_and_cluster_tables(
     augment_with_compatible_tables: bool = False,
     threshold: float = 0.12,
     use_cache: bool = True,
-) -> Tuple[List[Dict[str, Any]], Dict[str, Any], List[Dict[str, Any]]]:
+    model: Optional[Any] = None,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any], List[Dict[str, Any]], Any]:
     if len(enriched_tables) < 2 or not similarities:
         print("Less than 2 tables or no similarities, skipping clustering")
-        return [], {}, enriched_tables
+        return [], {}, enriched_tables, model
 
     print(f"Clustering {len(enriched_tables)} tables using {len(similarities)} similarity pairs...")
     updated_similarities = _update_similarities_with_enriched_tables(similarities, enriched_tables)
     print(f"Updated {len(updated_similarities)} similarity pairs with enriched data")
 
-    try:
-        model = config.create_llm()
-    except ImportError as e:
-        msg = str(e)
-        # Common case: provider extras not installed (e.g., `together:` → langchain-together)
-        print("\n❌ Unable to create LLM client for the requested model.")
-        print(f"   Model: {getattr(config, 'llm_model', '')}")
-        print(f"   Error: {msg}")
-        if "langchain_together" in msg or "langchain-together" in msg:
-            print("\nInstall the missing provider package:")
-            print("  pip install -U langchain-together")
-        raise
     cache_dir = config.get_database_cache_dir("selections")
     selection_cache = get_selection_cache(cache_dir)
     return _select_tables(
@@ -860,13 +921,13 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument(
         "--threshold",
         type=float,
-        default=0.3,
+        default=0.5,
         help="Similarity threshold used by the original logic for augmentation decisions.",
     )
     p.add_argument(
         "--augment-with-compatible-tables",
         action="store_true",
-        default=True,
+        default=False,
         help="Apply augmentation after selection.",
     )
     p.add_argument("--no-cache", action="store_true", default=False, help="Disable reading/writing selection cache.")
@@ -887,6 +948,15 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         type=int,
         default=None,
         help="Optional number of contiguous partitions. Use together with --partition.",
+    )
+    p.add_argument(
+        "--merge-partitions-only",
+        action="store_true",
+        default=False,
+        help=(
+            "If set, skip table selection and only merge partition output files "
+            "(*_i_of_N.json) into the base output path. Requires --num-partitions."
+        ),
     )
     p.add_argument(
         "--num-samples",
@@ -917,6 +987,21 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         help="Output JSON path (defaults to results/<dataset>/{llm}_{embedding_model}/results_table_selection/selected_tables.json).",
     )
     p.add_argument("--indent", type=int, default=2, help="JSON indentation level.")
+    p.add_argument(
+        "--compat-use-csv-fastpath",
+        action="store_true",
+        default=True,
+        help=(
+            "If set, online compatibility calculation on cache miss uses CSV-first mode "
+            "(then SQL fallback), matching compatibility_calculator's --use-csv-fastpath behavior."
+        ),
+    )
+    p.add_argument(
+        "--compat-max-cached-table-profiles",
+        type=int,
+        default=463,
+        help="Max in-memory cached CSV table profiles for online compatibility calculation.",
+    )
     return p.parse_args(argv)
 
 
@@ -950,6 +1035,32 @@ def _append_partition_suffix(path: Path, *, partition: int, num_partitions: int)
     if path.suffix:
         return path.with_name(f"{path.stem}{suffix}{path.suffix}")
     return path.with_name(f"{path.name}{suffix}")
+
+
+def _merge_partition_json_lists(base_path: Path, *, num_partitions: int) -> Tuple[List[Any], int]:
+    """
+    Merge list-valued partition JSON files into a single list.
+
+    Reads files named like:
+      <base_stem>_<partition>_of_<num_partitions><suffix>
+    """
+    merged: List[Any] = []
+    files_found = 0
+    for part in range(int(num_partitions)):
+        part_path = _append_partition_suffix(base_path, partition=part, num_partitions=num_partitions)
+        if not part_path.exists():
+            print(f"⚠️  Missing partition file, skipping: {part_path}")
+            continue
+        try:
+            payload = _read_json(part_path)
+            if isinstance(payload, list):
+                merged.extend(payload)
+                files_found += 1
+            else:
+                print(f"⚠️  Partition file is not a list, skipping: {part_path}")
+        except Exception as e:
+            print(f"⚠️  Failed to read partition file '{part_path}': {e}")
+    return merged, files_found
 
 
 def _normalize_table_id(table_id: Any) -> str:
@@ -1043,6 +1154,14 @@ def _table_id_from_enriched(enriched: Dict[str, Any]) -> str:
     return f"{db_id}#sep#{table_name}" if db_id and table_name else table_name
 
 
+def _parse_table_identifier(table_id: str) -> Tuple[str, str]:
+    normalized = _normalize_table_id(table_id)
+    if "#sep#" in normalized:
+        db_id, table_name = normalized.split("#sep#", 1)
+        return db_id.strip().lower(), table_name.strip().lower()
+    return "", normalized.strip().lower()
+
+
 def _load_enriched_table_from_cache(enriched_dir: Path, table_id: str) -> Dict[str, Any]:
     """
     Load one enriched table entry from cache.
@@ -1090,33 +1209,94 @@ def _load_enriched_table_from_cache(enriched_dir: Path, table_id: str) -> Dict[s
     return meta
 
 
-def _load_compatibility_details(compat_dir: Path, table_a: str, table_b: str) -> Dict[str, Any]:
+def _load_compatibility_details(
+    compat_dir: Path,
+    table_a: str,
+    table_b: str,
+    *,
+    config: Optional[Configuration] = None,
+    compat_calculator: Optional[Any] = None,
+    compat_storage: Optional[Any] = None,
+) -> Dict[str, Any]:
     a = _normalize_table_id(table_a)
     b = _normalize_table_id(table_b)
     cand1 = (compat_dir / f"{a}-{b}.json").resolve()
     cand2 = (compat_dir / f"{b}-{a}.json").resolve()
     path = cand1 if cand1.exists() else (cand2 if cand2.exists() else None)
-    if path is None:
+    if path is not None:
+        try:
+            raw = _read_json(path)
+            return raw if isinstance(raw, dict) else {}
+        except Exception:
+            return {}
+
+    if compat_calculator is None or config is None:
         return {
             "overall_compatibility": 0.0,
             "best_join_columns": ["", ""],
             "join_confidence": 0.0,
         }
+
+    db_a, table_name_a = _parse_table_identifier(a)
+    db_b, table_name_b = _parse_table_identifier(b)
+    if not db_a or not db_b or not table_name_a or not table_name_b:
+        return {
+            "overall_compatibility": 0.0,
+            "best_join_columns": ["", ""],
+            "join_confidence": 0.0,
+        }
+
     try:
-        raw = _read_json(path)
-        return raw if isinstance(raw, dict) else {}
-    except Exception:
-        return {}
+        _ = compat_calculator.calculate_table_compatibility(
+            {"db_id": db_a, "table_name": table_name_a},
+            {"db_id": db_b, "table_name": table_name_b},
+        )
+        if compat_storage is not None:
+            cached_payload = compat_storage.get_cached_compatibility_score(a, b)
+            if isinstance(cached_payload, dict) and cached_payload:
+                return cached_payload
+        # Fallback: read from file if storage lookup is unavailable.
+        path_after = cand1 if cand1.exists() else (cand2 if cand2.exists() else None)
+        if path_after is not None:
+            try:
+                raw = _read_json(path_after)
+                if isinstance(raw, dict):
+                    return raw
+            except Exception:
+                pass
+        return {
+            "overall_compatibility": 0.0,
+            "best_join_columns": ["", ""],
+            "join_confidence": 0.0,
+        }
+    except Exception as e:
+        print(f"⚠️  Failed online compatibility calculation for {a} <-> {b}: {e}")
+        return {
+            "overall_compatibility": 0.0,
+            "best_join_columns": ["", ""],
+            "join_confidence": 0.0,
+        }
 
 
 def _build_similarities_for_tables(
     compat_dir: Path,
     table_ids: List[str],
+    *,
+    config: Optional[Configuration] = None,
+    compat_calculator: Optional[Any] = None,
+    compat_storage: Optional[Any] = None,
 ) -> List[Dict[str, Any]]:
     sims: List[Dict[str, Any]] = []
     for i in range(len(table_ids)):
         for j in range(i + 1, len(table_ids)):
-            details = _load_compatibility_details(compat_dir, table_ids[i], table_ids[j])
+            details = _load_compatibility_details(
+                compat_dir,
+                table_ids[i],
+                table_ids[j],
+                config=config,
+                compat_calculator=compat_calculator,
+                compat_storage=compat_storage,
+            )
             try:
                 sim_val = float(details.get("overall_compatibility", 0.0))
             except Exception:
@@ -1158,6 +1338,58 @@ def main(args: argparse.Namespace) -> int:
     else:
         data_path = (run_dir / f"{str(args.dataset)}_k_{int(args.top_k)}.json").resolve()
 
+    # Resolve output paths early so merge-only mode can run without selection.
+    if args.out:
+        out_path = Path(args.out).expanduser().resolve()
+    else:
+        out_dir = get_results_run_dir(
+            dataset=str(config.database_type.value),
+            step_dirname="results_table_selection",
+            llm_model=str(config.llm_model),
+            embedding_model=str(getattr(config, "embedding_model", "unknown")),
+            project_root=PROJECT_ROOT,
+        )
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_path = (out_dir / "selected_tables.json").resolve()
+
+    out_details_path = (
+        Path(args.out_details).expanduser().resolve()
+        if args.out_details
+        else out_path.with_name("selected_tables_details.json")
+    )
+
+    if bool(getattr(args, "merge_partitions_only", False)):
+        if getattr(args, "num_partitions", None) is None:
+            print("❌ --merge-partitions-only requires --num-partitions.")
+            return 1
+        if int(args.num_partitions) <= 0:
+            print("❌ --num-partitions must be > 0 for merge mode.")
+            return 1
+
+        merged_selected, files_found = _merge_partition_json_lists(out_path, num_partitions=int(args.num_partitions))
+        if files_found == 0:
+            print("❌ No partition result files found to merge.")
+            return 1
+        _write_json(out_path, merged_selected, indent=int(args.indent))
+        print(
+            f"Merged {files_found}/{int(args.num_partitions)} partition files "
+            f"into selected tables: {out_path} (rows={len(merged_selected)})"
+        )
+
+        if args.out_details or bool(args.write_details):
+            merged_details, details_files_found = _merge_partition_json_lists(
+                out_details_path, num_partitions=int(args.num_partitions)
+            )
+            if details_files_found > 0:
+                _write_json(out_details_path, merged_details, indent=int(args.indent))
+                print(
+                    f"Merged {details_files_found}/{int(args.num_partitions)} partition files "
+                    f"into details: {out_details_path} (rows={len(merged_details)})"
+                )
+            else:
+                print("ℹ️  No details partition files found to merge.")
+        return 0
+
     # If --retrieved-scores is omitted, point it to the dense-retriever scores file.
     if args.retrieved_scores:
         retrieved_scores_path: Optional[Path] = Path(args.retrieved_scores).expanduser().resolve()
@@ -1173,6 +1405,7 @@ def main(args: argparse.Namespace) -> int:
         if args.similarities
         else Path(config.get_database_cache_dir("compatibility")).expanduser().resolve()
     )
+    compat_dir.mkdir(parents=True, exist_ok=True)
 
     database_type = DatabaseType(args.dataset)
     queries_path = Path(args.queries_file).expanduser().resolve() if args.queries_file else _default_queries_path(database_type)
@@ -1261,6 +1494,28 @@ def main(args: argparse.Namespace) -> int:
         )
     print(f"Processing partition-local slice {start}..{end_local-1} (count={end_local-start})")
 
+    compat_calculator = None
+    compat_storage = None
+    try:
+        from offline_preprocessing.compatibility_calculator import CompatibilityCalculator
+        from utils.storage_manager import UnifiedStorageManager
+
+        compat_cache_root = compat_dir.parent
+        storage = UnifiedStorageManager(config=config, cache_dir=str(compat_cache_root))
+        compat_storage = storage
+        compat_calculator = CompatibilityCalculator(
+            config=config,
+            storage=storage,
+            embedding_model=str(getattr(config, "embedding_model", "openai:text-embedding-3-large")),
+            use_csv_fastpath=bool(getattr(args, "compat_use_csv_fastpath", False)),
+            max_cached_table_profiles=max(1, int(getattr(args, "compat_max_cached_table_profiles", 8))),
+        )
+    except Exception as e:
+        print(f"⚠️  Could not initialize online compatibility calculator: {e}")
+        compat_calculator = None
+
+    shared_model: Optional[Any] = None
+
     for pos in positions:
         idx = selected_indices[pos]
         q = queries[idx] if 0 <= idx < len(queries) else {}
@@ -1290,9 +1545,15 @@ def main(args: argparse.Namespace) -> int:
             enriched_tables.append(meta)
 
         # Load pairwise compatibilities from cache and convert to similarity list with indices
-        similarities = _build_similarities_for_tables(compat_dir, retrieved_tables)
+        similarities = _build_similarities_for_tables(
+            compat_dir,
+            retrieved_tables,
+            config=config,
+            compat_calculator=compat_calculator,
+            compat_storage=compat_storage,
+        )
 
-        clustered_tables, cluster_summary, _ = validate_and_cluster_tables(
+        clustered_tables, cluster_summary, _, shared_model = validate_and_cluster_tables(
             enriched_tables,
             similarities,
             query_text,
@@ -1301,6 +1562,7 @@ def main(args: argparse.Namespace) -> int:
             augment_with_compatible_tables=bool(args.augment_with_compatible_tables),
             threshold=float(args.threshold),
             use_cache=not bool(args.no_cache),
+            model=shared_model,
         )
 
         selected_tables: List[str] = []
@@ -1369,19 +1631,6 @@ def main(args: argparse.Namespace) -> int:
             )
 
         print(f"  - processed question_id={idx} (selected={len(selected_tables)})")
-
-    if args.out:
-        out_path = Path(args.out).expanduser().resolve()
-    else:
-        out_dir = get_results_run_dir(
-            dataset=str(config.database_type.value),
-            step_dirname="results_table_selection",
-            llm_model=str(config.llm_model),
-            embedding_model=str(getattr(config, "embedding_model", "unknown")),
-            project_root=PROJECT_ROOT,
-        )
-        out_dir.mkdir(parents=True, exist_ok=True)
-        out_path = (out_dir / "selected_tables.json").resolve()
 
     # If partitioning is enabled, suffix outputs with `{partition}_of_{num_partitions}`.
     if getattr(args, "partition", None) is not None and getattr(args, "num_partitions", None) is not None:

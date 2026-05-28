@@ -27,7 +27,7 @@ qa_prompt = (
 def get_selection_prompt_lrm_few_shot(query: str, tables_content: str, compatibility_analysis: str) -> str:
     """Generate the combined validation and selection prompt with query and tables context."""
     return f"""You are a SQL schema analyst.
-Your task: From a set of retrieved tables, identify the a comprehensive set of tables that are BOTH:
+Your task: From a set of retrieved tables, identify a comprehensive set of tables that are BOTH:
 (1) Relevant to the given query, and  
 (2) Compatible (joinable) with each other to answer the query.
 
@@ -209,53 +209,23 @@ def get_sql_generation_prompt_lrm(query: str, table_schemas: Dict[str, Dict[str,
         for rel in table_relationships:
             relationships_text += f"  - {rel.get('from_table', 'unknown')}.{rel.get('from_column', 'unknown')} → {rel.get('to_table', 'unknown')}.{rel.get('to_column', 'unknown')}\n"
     
-    return f"""You are an expert SQL developer. Your task is to generate a single, correct SQL query for SQLite based on:
-1) A database schema with columns, types, and sample values.
-2) Optional external knowledge.
-3) A natural-language question.
+    return f"""You are an expert SQL query generator. Given the following tables and a natural language question, generate a precise SQL query that answers the question. The target dialect is SQLite.
 
-Rules:
-- Output only the SQL query. No explanations, no comments.
-- Use only the provided tables/columns; never invent schema or values.
-- Use explicit JOIN ... ON ... syntax; avoid cartesian products.
-- Qualify ambiguous column names with table names or aliases.
-- Use DISTINCT, GROUP BY, HAVING, ORDER BY, LIMIT, and aggregates when required.
-- Treat sample values as illustrative, not exhaustive.
-
----
-
-One-shot Example:
-
-Database Schema:
-Table: satscores
-  - cds: TEXT [values: '10101080000000', '10101080109991', '10101080111682', '10101080119628', '10621170000000']
-  - rtype: TEXT [values: 'S', 'D']
-  - sname: TEXT [values: 'Middle College High', 'John F. Kennedy High', 'Independence High', 'Foothill High', 'Washington High']
-  - dname: TEXT [values: 'Los Angeles Unified', 'San Diego Unified', 'Oakland Unified', 'San Francisco Unified', 'Kern High']
-  - cname: TEXT [values: 'Los Angeles', 'San Diego', 'San Bernardino', 'Riverside', 'Orange']
-  - enroll12: INTEGER [values: 16, 55, 36, 30, 29]
-  - NumTstTakr: INTEGER [values: 0, 1, 2, 3, 4]
-  - AvgScrRead: INTEGER [values: 498, 516, 451, 523, 499]
-  - AvgScrMath: INTEGER [values: 462, 451, 505, 445, 506]
-  - AvgScrWrite: INTEGER [values: 489, 442, 468, 449, 425]
-  - NumGE1500: INTEGER [values: 11, 6, 15, 16, 4]
-
-Table: schools
-  - CDSCode: TEXT [values: '10101080000000', '10101080109991', '10101080111682', '10101080119628', '10621170000000']
-  - District: TEXT [values: 'Los Angeles Unified', 'San Diego Unified', 'Oakland Unified', 'San Francisco Unified', 'Kern High']
-  - StatusType: TEXT [values: 'Active', 'Closed']
-
-External knowledge: avg = total / count
-Question: Which active district has the highest average score in Reading?
-Answer: SELECT T1.District FROM schools AS T1 INNER JOIN satscores AS T2 ON T1.CDSCode = T2.cds WHERE T1.StatusType = 'Active' ORDER BY T2.AvgScrRead DESC LIMIT 1
-
----
-
-Input Template:
-
-Database Schema:
+AVAILABLE TABLES:
 {schema_text}
 
 External knowledge: {evidence}
-Question: {query}
-Answer:"""
+
+QUESTION: {query}
+
+INSTRUCTIONS:
+1. Analyze the question carefully to understand what information is being requested.
+2. Identify which tables and columns are needed from the available tables. Use only the provided tables and columns; never invent schema or values. Treat sample values in the schema as illustrative, not exhaustive.
+3. Generate a syntactically correct SQL query that answers the question.
+4. Use explicit JOIN ... ON ... with appropriate JOINs when multiple tables are needed; avoid cartesian products.
+5. Apply proper filtering, grouping, ordering, LIMIT, DISTINCT, HAVING, and aggregates as required.
+6. Use the exact column names as shown in the schema; qualify ambiguous column names with table names or aliases.
+7. Be careful with column names that contain spaces—use backticks or quotes as needed.
+8. Return ONLY the SQL query without any explanation, comments, or markdown formatting.
+
+SQL QUERY:"""

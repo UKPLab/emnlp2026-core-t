@@ -17,9 +17,11 @@ Usage:
 """
 
 import argparse
+import csv
 import json
 import sys
 import time
+from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -42,7 +44,7 @@ if str(PROJECT_ROOT) not in sys.path:
 load_dotenv(PROJECT_ROOT / ".env")
 
 from utils import Configuration, DatabaseType
-from utils.db_connector import get_connection, get_database_schema
+from utils.db_connector import get_connection, get_database_path, get_database_schema
 from utils.cache_scripts.faiss_vector_cache import get_faiss_vector_cache
 from utils.storage_manager import UnifiedStorageManager, get_unified_storage_manager
 
@@ -208,12 +210,14 @@ class CompatibilityCalculator:
         config: Configuration,
         storage: UnifiedStorageManager,
         embedding_model: str,
+        use_csv_fastpath: bool = False,
         use_jaccard: bool = True,
         use_semantic: bool = True,
         use_exact: bool = True,
         use_subset: bool = True,
         use_uniqueness: bool = True,
         max_distinct: Optional[int] = None,
+        max_cached_table_profiles: int = 8,
     ) -> None:
         self.config = config
         self.storage = storage
@@ -223,6 +227,7 @@ class CompatibilityCalculator:
         self.use_exact = bool(use_exact)
         self.use_subset = bool(use_subset)
         self.use_uniqueness = bool(use_uniqueness)
+        self.use_csv_fastpath = bool(use_csv_fastpath)
         self.max_distinct = None if max_distinct is None else int(max_distinct)
 
         cache_root = Path(self.storage.cache_dir)
@@ -244,6 +249,100 @@ class CompatibilityCalculator:
         )
 
         self._params_dirty = False
+        # Optional CSV-backed table profile cache:
+        # table_id -> {"column_stats": {col: {"null_count", "non_null_count", "distinct_values"}}}
+        self._table_profile_cache: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
+        # Keep memory bounded; values are large sets for wide/high-cardinality tables.
+        self._max_cached_table_profiles = max(1, int(max_cached_table_profiles))
+
+    def _is_null_csv_value(self, v: Any) -> bool:
+        """Best-effort NULL normalization for CSV exports."""
+        if v is None:
+            return True
+        s = str(v).strip()
+        if s == "":
+            return True
+        return s.lower() in {"null", "none", "nan", "nat"}
+
+    def _resolve_csv_file_path(self, db_id: str, table_name: str) -> Optional[Path]:
+        """
+        Resolve CSV path for a table under:
+          sql_database/<dataset>/<db_id>/data_csv/<table>.csv
+        """
+        try:
+            db_path = Path(get_database_path(db_id, self.config))
+            csv_dir = db_path.parent / "data_csv"
+            if not csv_dir.exists():
+                return None
+            direct = csv_dir / f"{table_name}.csv"
+            if direct.exists():
+                return direct
+            target = str(table_name).lower()
+            for p in csv_dir.glob("*.csv"):
+                if p.stem.lower() == target:
+                    return p
+        except Exception:
+            return None
+        return None
+
+    def _load_table_profile_from_csv(self, db_id: str, table_id: str, table_name: str, schema: Dict[str, str]) -> Optional[Dict[str, Any]]:
+        if not self.use_csv_fastpath:
+            return None
+
+        profile_key = str(table_id).lower()
+        if profile_key in self._table_profile_cache:
+            self._table_profile_cache.move_to_end(profile_key)
+            return self._table_profile_cache[profile_key]
+
+        csv_path = self._resolve_csv_file_path(db_id, table_name)
+        if csv_path is None:
+            return None
+
+        schema_cols = list(schema.keys())
+        if not schema_cols:
+            return None
+        schema_cols_set = set(schema_cols)
+        stats: Dict[str, Dict[str, Any]] = {
+            col: {"null_count": 0, "non_null_count": 0, "distinct_values": set()} for col in schema_cols
+        }
+
+        try:
+            with csv_path.open("r", encoding="utf-8", newline="") as f:
+                reader = csv.DictReader(f)
+                csv_fields = list(reader.fieldnames or [])
+                field_by_schema_col: Dict[str, str] = {}
+                csv_fields_lower = {str(c).lower(): str(c) for c in csv_fields}
+                for col in schema_cols:
+                    if col in csv_fields:
+                        field_by_schema_col[col] = col
+                    else:
+                        mapped = csv_fields_lower.get(str(col).lower())
+                        if mapped is not None:
+                            field_by_schema_col[col] = mapped
+
+                # If there is no overlap, this CSV likely doesn't match the schema.
+                if not field_by_schema_col:
+                    return None
+
+                for row in reader:
+                    row_map = row if isinstance(row, dict) else {}
+                    for col, field_name in field_by_schema_col.items():
+                        val = row_map.get(field_name)
+                        col_stats = stats[col]
+                        if self._is_null_csv_value(val):
+                            col_stats["null_count"] += 1
+                        else:
+                            col_stats["non_null_count"] += 1
+                            col_stats["distinct_values"].add(str(val))
+        except Exception:
+            return None
+
+        profile = {"column_stats": stats, "schema_cols": schema_cols_set}
+        self._table_profile_cache[profile_key] = profile
+        self._table_profile_cache.move_to_end(profile_key)
+        while len(self._table_profile_cache) > int(self._max_cached_table_profiles):
+            self._table_profile_cache.popitem(last=False)
+        return profile
 
     def _maybe_flush_param_caches(self) -> None:
         if not self._params_dirty:
@@ -297,22 +396,50 @@ class CompatibilityCalculator:
                 out[str(k).split(TABLE_ID_SEPARATOR)[-1]] = _safe_float(v)
             return out
 
+        table_name = table_id.split(TABLE_ID_SEPARATOR, 1)[1]
+        csv_profile = self._load_table_profile_from_csv(db_id, table_id, table_name, schema)
+
+        # Preferred fast path: use pre-extracted CSV table content.
+        if csv_profile is not None:
+            out: Dict[str, float] = {}
+            col_stats_map = csv_profile.get("column_stats", {}) or {}
+            for col in schema.keys():
+                try:
+                    col_stats = col_stats_map.get(col, {}) or {}
+                    null_count = int(col_stats.get("null_count", 0) or 0)
+                    non_null_count = int(col_stats.get("non_null_count", 0) or 0)
+                    if null_count > 0:
+                        score = 0.0
+                    elif non_null_count <= 0:
+                        score = 0.0
+                    else:
+                        uniq = len(col_stats.get("distinct_values", set()) or set())
+                        score = float(uniq / non_null_count) if non_null_count > 0 else 0.0
+                    out[col] = _safe_float(score)
+                    self.uniqueness_cache[f"{table_id}{TABLE_ID_SEPARATOR}{col}"] = out[col]
+                except Exception:
+                    out[col] = 0.0
+                    self.uniqueness_cache[f"{table_id}{TABLE_ID_SEPARATOR}{col}"] = 0.0
+            self._params_dirty = True
+            return out
+
+        # Fallback: original SQL-based behavior.
         cur = conn.cursor()
         out: Dict[str, float] = {}
         for col in schema.keys():
             try:
-                cur.execute(f'SELECT COUNT(*) FROM "{table_id.split(TABLE_ID_SEPARATOR,1)[1]}" WHERE "{col}" IS NULL')
+                cur.execute(f'SELECT COUNT(*) FROM "{table_name}" WHERE "{col}" IS NULL')
                 null_count = int(cur.fetchone()[0] or 0)
                 if null_count > 0:
                     score = 0.0
                 else:
-                    cur.execute(f'SELECT COUNT(*) FROM "{table_id.split(TABLE_ID_SEPARATOR,1)[1]}" WHERE "{col}" IS NOT NULL')
+                    cur.execute(f'SELECT COUNT(*) FROM "{table_name}" WHERE "{col}" IS NOT NULL')
                     total = int(cur.fetchone()[0] or 0)
                     if total <= 0:
                         score = 0.0
                     else:
                         cur.execute(
-                            f'SELECT COUNT(DISTINCT "{col}") FROM "{table_id.split(TABLE_ID_SEPARATOR,1)[1]}" WHERE "{col}" IS NOT NULL'
+                            f'SELECT COUNT(DISTINCT "{col}") FROM "{table_name}" WHERE "{col}" IS NOT NULL'
                         )
                         uniq = int(cur.fetchone()[0] or 0)
                         score = float(uniq / total) if total > 0 else 0.0
@@ -325,7 +452,24 @@ class CompatibilityCalculator:
         self._params_dirty = True
         return out
 
-    def _distinct_values(self, conn, table_name: str, column: str) -> Set[str]:
+    def _distinct_values(
+        self,
+        conn,
+        db_id: str,
+        table_id: str,
+        table_name: str,
+        column: str,
+        schema: Dict[str, str],
+    ) -> Set[str]:
+        csv_profile = self._load_table_profile_from_csv(db_id, table_id, table_name, schema)
+        if csv_profile is not None:
+            col_stats = (csv_profile.get("column_stats", {}) or {}).get(column, {}) or {}
+            vals = list(col_stats.get("distinct_values", set()) or set())
+            if self.max_distinct is None or self.max_distinct <= 0:
+                return set(vals)
+            return set(vals[: int(self.max_distinct)])
+
+        # Fallback: original SQL-based behavior.
         cur = conn.cursor()
         # If max_distinct is None/<=0, do not apply a LIMIT (unbounded).
         if self.max_distinct is None or self.max_distinct <= 0:
@@ -361,12 +505,12 @@ class CompatibilityCalculator:
         cols2 = list(schema2.keys())
         for c1 in cols1:
             try:
-                v1 = self._distinct_values(conn1, table1_name, c1)
+                v1 = self._distinct_values(conn1, table1_id.split(TABLE_ID_SEPARATOR, 1)[0], table1_id, table1_name, c1, schema1)
             except Exception:
                 continue
             for c2 in cols2:
                 try:
-                    v2 = self._distinct_values(conn2, table2_name, c2)
+                    v2 = self._distinct_values(conn2, table2_id.split(TABLE_ID_SEPARATOR, 1)[0], table2_id, table2_name, c2, schema2)
                 except Exception:
                     continue
                 if not v1 and not v2:
@@ -406,12 +550,12 @@ class CompatibilityCalculator:
         cols2 = list(schema2.keys())
         for c1 in cols1:
             try:
-                v1 = self._distinct_values(conn1, table1_name, c1)
+                v1 = self._distinct_values(conn1, table1_id.split(TABLE_ID_SEPARATOR, 1)[0], table1_id, table1_name, c1, schema1)
             except Exception:
                 continue
             for c2 in cols2:
                 try:
-                    v2 = self._distinct_values(conn2, table2_name, c2)
+                    v2 = self._distinct_values(conn2, table2_id.split(TABLE_ID_SEPARATOR, 1)[0], table2_id, table2_name, c2, schema2)
                 except Exception:
                     continue
                 subset_score = 1.0 if (v1 and v2 and (v1.issubset(v2) or v2.issubset(v1))) else 0.0
@@ -645,6 +789,22 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         default=0,
         help="Max distinct values per column for jaccard/subset. Use 0 to disable the limit (default).",
     )
+    parser.add_argument(
+        "--use-csv-fastpath",
+        action="store_true",
+        default=True,
+        help=(
+            "If set, prefer loading table content from sql_database/<dataset>/<db_id>/data_csv/*.csv "
+            "for uniqueness/distinct computations, with SQL fallback on miss/error. "
+            "Default is SQL-only behavior."
+        ),
+    )
+    parser.add_argument(
+        "--max-cached-table-profiles",
+        type=int,
+        default=463,
+        help="Maximum number of parsed CSV table profiles to keep in the in-memory LRU cache.",
+    )
 
     return parser.parse_args(argv)
 
@@ -692,12 +852,14 @@ def main(args: argparse.Namespace) -> int:
         config=config,
         storage=storage,
         embedding_model=str(args.embedding_model),
+        use_csv_fastpath=bool(args.use_csv_fastpath),
         use_jaccard=args.jaccard,
         use_semantic=args.semantic,
         use_exact=args.exact,
         use_subset=args.subset,
         use_uniqueness=args.uniqueness,
         max_distinct=None if int(args.max_distinct) <= 0 else int(args.max_distinct),
+        max_cached_table_profiles=max(1, int(args.max_cached_table_profiles)),
     )
 
     started = time.time()
