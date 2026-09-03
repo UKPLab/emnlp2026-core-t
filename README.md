@@ -7,6 +7,7 @@
 [![Arxiv](https://img.shields.io/badge/Arxiv-2601.13111-red?style=flat-square&logo=arxiv&logoColor=white)](https://www.arxiv.org/abs/2601.13111)
 [![License](https://img.shields.io/badge/License-Apache--2.0-green?style=flat-square)](https://opensource.org/licenses/Apache-2.0)
 [![Python Versions](https://img.shields.io/badge/Python-3.12-blue.svg?style=flat-square&logo=python&logoColor=white)](https://www.python.org/)
+[![Project Page](https://img.shields.io/badge/Project-Page-1e3a5f?style=flat-square&logo=githubpages&logoColor=white)](https://ukplab.github.io/emnlp2026-core-t/)
 
 <p align="center">
   <img src="assets/assumption.png" style="width:50%">

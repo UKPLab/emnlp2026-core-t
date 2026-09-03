@@ -19,6 +19,7 @@ venv/
 
 # Secrets / local config
 .env
+CORE-T_camera_ready.pdf
 
 # OS / editor
 .DS_Store
