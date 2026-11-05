@@ -25,9 +25,13 @@
   <meta name="citation_author" content="Gupta, Vivek">
   <meta name="citation_author" content="Roth, Dan">
   <meta name="citation_author" content="Gurevych, Iryna">
-  <meta name="citation_publication_date" content="2026">
+  <meta name="citation_publication_date" content="2026/10">
   <meta name="citation_conference_title" content="Proceedings of the 2026 Conference on Empirical Methods in Natural Language Processing">
-  <meta name="citation_pdf_url" content="https://arxiv.org/pdf/2601.13111">
+  <meta name="citation_firstpage" content="2082">
+  <meta name="citation_lastpage" content="2114">
+  <meta name="citation_pdf_url" content="https://aclanthology.org/2026.emnlp-main.89.pdf">
+  <meta name="citation_fulltext_html_url" content="https://aclanthology.org/2026.emnlp-main.89/">
+  <meta name="citation_doi" content="10.18653/2026.emnlp-main.89">
   <meta name="citation_arxiv_id" content="2601.13111">
 
   <script>document.documentElement.classList.add("js");</script>
@@ -43,11 +47,17 @@
       {"@type": "Person", "name": "Dan Roth", "url": "https://www.cis.upenn.edu/~danroth/"},
       {"@type": "Person", "name": "Iryna Gurevych", "url": "https://www.informatik.tu-darmstadt.de/ukp/ukp_home/head_ukp/index.en.jsp"}
     ],
-    "datePublished": "2026",
+    "datePublished": "2026-10",
     "publisher": {"@type": "Organization", "name": "Association for Computational Linguistics"},
-    "url": "https://arxiv.org/abs/2601.13111",
-    "sameAs": "https://doi.org/10.48550/arXiv.2601.13111",
-    "isAccessibleForFree": true
+    "url": "https://aclanthology.org/2026.emnlp-main.89/",
+    "sameAs": [
+      "https://doi.org/10.18653/2026.emnlp-main.89",
+      "https://arxiv.org/abs/2601.13111",
+      "https://doi.org/10.48550/arXiv.2601.13111"
+    ],
+    "isAccessibleForFree": true,
+    "pageStart": "2082",
+    "pageEnd": "2114"
   }
   </script>
 
@@ -775,7 +785,8 @@
     <section class="links" aria-label="Project resources">
       <div class="container">
         <div class="links-row">
-          <a href="https://arxiv.org/pdf/2601.13111" class="link-btn link-btn-primary" target="_blank" rel="noopener"><i class="fa-solid fa-file-pdf" aria-hidden="true"></i> Paper</a>
+          <a href="https://aclanthology.org/2026.emnlp-main.89.pdf" class="link-btn link-btn-primary" target="_blank" rel="noopener"><i class="fa-solid fa-file-pdf" aria-hidden="true"></i> Paper</a>
+          <a href="https://aclanthology.org/2026.emnlp-main.89/" class="link-btn" target="_blank" rel="noopener"><i class="ai ai-acl" aria-hidden="true"></i> ACL Anthology</a>
           <a href="https://arxiv.org/abs/2601.13111" class="link-btn" target="_blank" rel="noopener"><i class="ai ai-arxiv" aria-hidden="true"></i> ArXiv</a>
           <a href="https://github.com/UKPLab/emnlp2026-core-t" class="link-btn" target="_blank" rel="noopener"><i class="fa-brands fa-github" aria-hidden="true"></i> Code</a>
           <a href="https://tudatalib.ulb.tu-darmstadt.de/handle/tudatalib/4993" class="link-btn" target="_blank" rel="noopener"><i class="fa-solid fa-database" aria-hidden="true"></i> Data</a>
@@ -1197,19 +1208,24 @@ python table_augmentor.py \
         <div class="section-heading fade-up">
           <div class="section-label">Reference</div>
           <h2><span class="title-gradient">Citation</span></h2>
-          <p class="section-intro">If you use CORE-T, please cite the current arXiv version.</p>
+          <p class="section-intro">If you use CORE-T, please cite the EMNLP 2026 proceedings version.</p>
         </div>
         <div class="bibtex-wrapper fade-up">
           <div class="bibtex-header" aria-hidden="true"><span class="code-dot"></span><span class="code-dot"></span><span class="code-dot"></span></div>
           <button class="copy-button" type="button" data-copy-bibtex><i class="fa-regular fa-copy" aria-hidden="true"></i> Copy</button>
-          <pre><code id="bibtex">@misc{soliman2026core-t,
-    title         = {CORE-T: COherent REtrieval of Tables for Text-to-SQL},
-    author        = {Hassan Soliman and Vivek Gupta and Dan Roth and Iryna Gurevych},
-    year          = {2026},
-    eprint        = {2601.13111},
-    archivePrefix = {arXiv},
-    primaryClass  = {cs.CL},
-    url           = {https://arxiv.org/abs/2601.13111}
+          <pre><code id="bibtex">@inproceedings{soliman-etal-2026-core,
+    title     = {{CORE}-{T}: {CO}herent {RE}trieval of Tables for Text-to-{SQL}},
+    author    = {Soliman, Hassan and Gupta, Vivek and Roth, Dan and Gurevych, Iryna},
+    editor    = {Lee, Hung-Yi and Dev, Sunipa and Li, Junyi Jessy and Elliott, Desmond},
+    booktitle = {Proceedings of the 2026 Conference on Empirical Methods in Natural Language Processing},
+    month     = oct,
+    year      = {2026},
+    address   = {Budapest, Hungary},
+    publisher = {Association for Computational Linguistics},
+    url       = {https://aclanthology.org/2026.emnlp-main.89/},
+    doi       = {10.18653/2026.emnlp-main.89},
+    pages     = {2082--2114},
+    ISBN      = {979-8-89176-459-0}
 }</code></pre>
         </div>
       </div>
